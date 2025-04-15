@@ -20,15 +20,25 @@ def create_back_button(callback_data: str) -> InlineKeyboardMarkup:
         ]
     )
 
-def get_pagination_keyboard(position, current_page: int, total_pages: int) -> InlineKeyboardMarkup:
-    buttons = []
+def get_pagination_keyboard(position, current_page: int, total_pages: int, buttons=None) -> InlineKeyboardMarkup:
+    keyboard = []
 
+    # Верхний ряд — пагинация
+    pagination_buttons = []
     if current_page > 1:
-        buttons.append(InlineKeyboardButton(text="⬅", callback_data=f"{position}:{current_page - 1}"))
+        pagination_buttons.append(InlineKeyboardButton(text="⬅", callback_data=f"{position}:{current_page - 1}"))
     if current_page < total_pages:
-        buttons.append(InlineKeyboardButton(text="➡", callback_data=f"{position}:{current_page + 1}"))
+        pagination_buttons.append(InlineKeyboardButton(text="➡", callback_data=f"{position}:{current_page + 1}"))
 
-    return InlineKeyboardMarkup(inline_keyboard=[buttons]) if buttons else None
+    if pagination_buttons:
+        keyboard.append(pagination_buttons)
+
+    # Нижние ряды — пользовательские кнопки по 2 в ряд
+    if buttons:
+        for i in range(0, len(buttons), 2):
+            keyboard.append(buttons[i:i + 2])
+
+    return InlineKeyboardMarkup(inline_keyboard=keyboard) if keyboard else None
 
 dp = Router()
 
@@ -71,7 +81,7 @@ async def show_main_menu(call: CallbackQuery):
     await call.message.edit_text(text, reply_markup=user_main_menu())
 
 
-@dp.message(Command("menu"))
+@dp.message(F.text == "☁️ Меню")
 async def show_main_menu(message: Message):
     user_id = message.from_user.id
     username = message.from_user.first_name
@@ -100,7 +110,17 @@ async def show_main_menu(message: Message):
 
 @dp.callback_query(F.data == "pass")
 async def menu_pass(call: CallbackQuery):
-    await call.message.answer(
+    kb = [
+        [InlineKeyboardButton(text="🌠 Купить пропуск", callback_data="buy_pass")],
+        [back_button("menu")],
+    ]
+
+    builder = InlineKeyboardBuilder()
+    for row in kb:
+        builder.row(*row)
+    await call.answer()
+
+    await call.message.edit_text(
         "💼 Pass - 🔒 <b>Что даст тебе PoTi Pass?</b>\n\n"
         "⛺ <b>Создай собственный клан</b>\n"
         "⏳ <b>Получай карточки каждые 3 часа</b> вместо 4\n"
@@ -111,7 +131,7 @@ async def menu_pass(call: CallbackQuery):
         "🧍 <b>Используй смайлики в никнейме</b>\n"
         "🌀 <b>+3 крутки</b>\n"
         "🗓 <b>Срок действия:</b> 30 дней\n"
-        "🔑 <b>Стоимость:</b> 159 рублей"
+        "🔑 <b>Стоимость:</b> 159 рублей", reply_markup=builder.as_markup()
     )
 
 @dp.callback_query(F.data == "rating:season")
@@ -127,7 +147,7 @@ async def menu_rating(call: CallbackQuery):
             InlineKeyboardButton(text="⭐ Топ кланов", callback_data="rating:clans"),
             InlineKeyboardButton(text="🛡 Топ арены", callback_data="rating:arena")
         ],
-        back_button("menu")
+        [back_button("menu")]
     ]
 
     builder = InlineKeyboardBuilder()
@@ -151,7 +171,7 @@ async def menu_shop(callback: CallbackQuery):
             "1000 PoTi Coin ➻ 100 руб\n"
             "3000 PoTi Coin ➻ (300) 200 руб\n"
             "10000 PoTi Coin ➻ (1000) 600 руб\n",
-            reply_markup=get_pagination_keyboard(position, current_page, total_pages)
+            reply_markup=get_pagination_keyboard(position, current_page, total_pages, buttons=[back_button("menu")])
         )
     elif current_page == 2:
         await callback.message.edit_text(
@@ -160,19 +180,48 @@ async def menu_shop(callback: CallbackQuery):
         "10 карт ➻ 1449 PoTi Coin\n"
         "30 карт ➻ 3000 PoTi Coin\n"
         "100 карт ➻ 10000 PoTi Coin\n",
-            reply_markup=get_pagination_keyboard(position, current_page, total_pages)
+            reply_markup=get_pagination_keyboard(position, current_page, total_pages, buttons=[back_button("menu")])
         )
     else:
         await callback.message.edit_text(
             f"{callback.from_user.first_name}, здесь ты можешь приобрести за PoTi Coin наши кейсы (эксклюзивные карточки):\n\n"
             "Кейс 1 - $$$\nКейс 2 - $$$\nКейс 3 - $$$",
-            reply_markup=get_pagination_keyboard(position, current_page, total_pages)
+            reply_markup=get_pagination_keyboard(position, current_page, total_pages, buttons=[back_button("menu")])
         )
 
 
 @dp.callback_query(F.data == "craft")
 async def menu_craft(call: CallbackQuery):
-    await call.message.edit_text("Функция крафта в процессе разработки.", reply_markup=user_main_menu())
+    common_duplicates, rare_duplicates, epic_duplicates, shards = "0000"
+    craft_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="Скрафтить из ⚡", callback_data="craft_common"),
+            InlineKeyboardButton(text="Скрафтить из ✨", callback_data="craft_rare")
+        ],
+        [
+            InlineKeyboardButton(text="Скрафтить из 🐉", callback_data="craft_epic"),
+            InlineKeyboardButton(text="Скрафтить из 🧱", callback_data="craft_shard")
+        ],
+        [
+            InlineKeyboardButton(text="⬅️ Назад", callback_data="menu")
+        ]
+    ])
+    text = (
+        f"<b>{call.from_user.first_name}</b>, ты можешь скрафтить попытки из повторок и осколков\n\n"
+        f"<b>🌐 Твои повторки и осколки</b>\n"
+        f"┏⚡ Обычные — {common_duplicates}\n"
+        f"┠✨ Редкие — {rare_duplicates}\n"
+        f"┠🐉 Эпические — {epic_duplicates}\n"
+        f"┗🧱 Осколки — {shards}\n\n"
+        f"<b>🍬 Стоимость крафтов</b>\n"
+        f"┏10 ⚡ карт ➠ 1 попытка\n"
+        f"┠10 ✨ карт ➠ 2 попытки\n"
+        f"┠10 🐉 карт ➠ 4 попытки\n"
+        f"┗10 🧱 оск. ➠ 1 попытка\n\n"
+        f"🛢 Чтобы скрафтить сразу из всех материалов, пиши команду\n"
+        f"<code>Крафт всех [Осколков/обычных/редких/эпических]</code>"
+    )
+    await call.message.edit_text(text=text, reply_markup=craft_keyboard)
 
 
 @dp.callback_query(F.data == "clans")

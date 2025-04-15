@@ -36,9 +36,8 @@ dp.include_router(router_main_menu)
 def main_menu():
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🃏 Получить карточку")],
-            [KeyboardButton(text="💼 Мои карты")],
-            [KeyboardButton(text="⚙️ Настройки")]
+            [KeyboardButton(text="🃏 Получить карточку"), KeyboardButton(text="💼 Мои карты")],
+            [KeyboardButton(text="☁️ Меню"), KeyboardButton(text="⚙️ Настройки")]
         ],
         resize_keyboard=True,
         input_field_placeholder="Выберите действие"
