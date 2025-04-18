@@ -1,469 +1,423 @@
-import sqlite3
-import random
-import string
-from datetime import datetime, timedelta
-
-from typing import Optional
-
+import psycopg2
+import psycopg2.extras # для DictCursor
+from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass
 
+reward_levels = [
+        (10, 5, 0),
+        (50, 10, 0),
+        (100, 15, 0),
+        (350, 20, 50),
+        (500, 50, 300),
+        (1000, 100, 1000),
+        (5000, 300, 5000),
+    ]
+
+# --- Конфигурация (лучше вынести в переменные окружения или .env файл) ---
+# Пример использования переменных окружения:
+# DB_NAME = os.getenv("DB_NAME", "cards_db")
+# DB_USER = os.getenv("DB_USER", "user")
+# DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
+# DB_HOST = os.getenv("DB_HOST", "localhost")
+# DB_PORT = os.getenv("DB_PORT", "5432")
+
+# Для примера оставим строки здесь, но НЕ ДЕЛАЙ ТАК В ПРОДАКШЕНЕ!
+DB_NAME = "postgres"
+DB_USER = "postgres"
+DB_PASSWORD = ""
+DB_HOST = "localhost"
+DB_PORT = "5432"
+
+DSN = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
+# --- Датаклассы и константы ---
 @dataclass
 class UserProfile:
     nickname: str
-    cards_owned: int
-    total_cards: int
+    cards_owned: int # Количество уникальных карт
+    total_cards_received: int
+    total_cards_in_game: int # Всего карт в игре
+    season_wins: int
+    season_losses: int
+    has_battle_pass: bool
+    all_wins: int
+    all_losses: int
     season_points: int
     coins: int
+    clan_name: Optional[str] = None
+    clan_role: Optional[str] = None
 
-
-RARITY_WEIGHTS = {
-    'common': 70,
-    'rare': 40,
-    'epic': 20,
-    'legendary': 8,
-    'mythical': 2
+rarity_translate = {
+    'common': ' ⚜️ Обычная',
+    'rare': '⚡️ Редкая',
+    'epic': ' 🐉 Эпическая',
+    'legendary': '🩸 Легендарная',
+    'mythical': '✨ Мифическая'
 }
 
-class CardDatabase:
-    def __init__(self, db_path='cards.db'):
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row
-        self.conn.execute("PRAGMA journal_mode=WAL;")
+RARITY_WEIGHTS = {
+    'common': 40,
+    'rare': 25,
+    'epic': 20,
+    'legendary': 10,
+    'mythical': 5
+}
+
+# --- Базовый класс для управления БД ---
+class DatabaseManager:
+    def __init__(self, dsn: str):
+        self.dsn = dsn
+        self._conn = None
+        self._connect()
         self.create_tables()
 
-    def create_tables(self):
-        self.conn.executescript("""
-            CREATE TABLE IF NOT EXISTS cards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                rarity TEXT NOT NULL,
-                attack INTEGER NOT NULL,
-                health INTEGER NOT NULL,
-                value INTEGER NOT NULL,
-                image_path TEXT,
-                drop_weight INTEGER DEFAULT 1
-            );
-
-            CREATE TABLE IF NOT EXISTS user_cards (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                card_id INTEGER NOT NULL,
-                amount INTEGER NOT NULL DEFAULT 1,
-                obtained_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS users (
-                user_id INTEGER PRIMARY KEY,
-                username TEXT,
-                registered_at TEXT NOT NULL,
-                clan_id INTEGER,
-                clan_role TEXT DEFAULT NULL,
-                has_battle_pass INTEGER NOT NULL DEFAULT 0,
-                rating INTEGER NOT NULL DEFAULT 0,
-                coins INTEGER NOT NULL DEFAULT 0,
-                last_card_received TEXT,
-                referrals INTEGER NOT NULL DEFAULT 0,
-                FOREIGN KEY (clan_id) REFERENCES clans(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS clans (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE,
-                description TEXT,
-                points INTEGER DEFAULT 0,
-                rank INTEGER DEFAULT 0,
-                leader_id INTEGER,
-                FOREIGN KEY (leader_id) REFERENCES users(user_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS daily_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                target INTEGER NOT NULL,
-                reward INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS user_daily_tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                task_id INTEGER NOT NULL,
-                progress INTEGER NOT NULL DEFAULT 0,
-                completed INTEGER NOT NULL DEFAULT 0,
-                date TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(user_id),
-                FOREIGN KEY (task_id) REFERENCES daily_tasks(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS promo_achievements (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code TEXT UNIQUE,
-                reward_amount INTEGER NOT NULL,
-                uses_left INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS user_promos (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                promo_id INTEGER NOT NULL,
-                used_at TEXT NOT NULL,
-                FOREIGN KEY (user_id) REFERENCES users(user_id),
-                FOREIGN KEY (promo_id) REFERENCES promo_achievements(id)
-            );
-        """)
-        self.conn.commit()
-
-    def generate_promo_code(self, reward_amount: int, uses: int = 1, custom_code: str = None):
-        code = custom_code or ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+    def _connect(self):
+        """Устанавливает соединение с БД."""
         try:
-            self.conn.execute("""
-                INSERT INTO promo_achievements (code, reward_amount, uses_left, created_at)
-                VALUES (?, ?, ?, ?)
-            """, (code, reward_amount, uses, datetime.utcnow().isoformat()))
-            self.conn.commit()
-            return code
-        except sqlite3.IntegrityError:
-            return None  # Код уже существует
+            self._conn = psycopg2.connect(self.dsn)
+            print("Успешное подключение к PostgreSQL")
+        except psycopg2.OperationalError as e:
+            print(f"Ошибка подключения к PostgreSQL: {e}")
+            # Здесь можно добавить логику повторного подключения или выхода
+            raise
 
-    def check_promo_valid(self, user_id: int, code: str):
-        promo = self.conn.execute("""
-            SELECT * FROM promo_achievements WHERE code = ? AND uses_left > 0
-        """, (code,)).fetchone()
-        if not promo:
-            return False, "Промокод недействителен или закончились использования."
+    def _get_connection(self):
+        """Возвращает активное соединение, переподключается при необходимости."""
+        try:
+            # Проверяем, живо ли соединение (ping)
+            if self._conn is None or self._conn.closed != 0:
+                self._connect()
+            # Можно добавить более надежную проверку:
+            # self._conn.cursor().execute("SELECT 1")
+        except psycopg2.OperationalError:
+            print("Переподключение к PostgreSQL...")
+            self._connect()
+        return self._conn
 
-        used = self.conn.execute("""
-            SELECT 1 FROM user_promos WHERE user_id = ? AND promo_id = ?
-        """, (user_id, promo['id'])).fetchone()
-        if used:
-            return False, "Вы уже использовали этот промокод."
+    def drop_all_tables(self):
+        """Удаляет все таблицы в схеме public."""
+        conn = self._get_connection()
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                DO $$
+                DECLARE
+                    r RECORD;
+                BEGIN
+                    FOR r IN (SELECT tablename FROM pg_tables WHERE schemaname = 'public') LOOP
+                        EXECUTE 'DROP TABLE IF EXISTS public.' || quote_ident(r.tablename) || ' CASCADE';
+                    END LOOP;
+                END $$;
+            """)
+            conn.commit()
+            return "Все таблицы были удалены."
 
-        return True, promo
+    def execute(self, query: str, params: tuple = None, fetch: str = None) -> Any:
+        """
+        Выполняет SQL-запрос.
+        :param query: SQL-запрос с плейсхолдерами %s.
+        :param params: Кортеж параметров для запроса.
+        :param fetch: 'one', 'all' или None.
+        :return: Результат запроса или None.
+        """
+        conn = self._get_connection()
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
+                cur.execute(query, params)
+                if fetch == 'one':
+                    result = cur.fetchone()
+                elif fetch == 'all':
+                    result = cur.fetchall()
+                else:
+                    result = None # Для INSERT, UPDATE, DELETE
+                conn.commit() # Коммитим изменения после успешного выполнения
+                return result
+        except psycopg2.Error as e:
+            conn.rollback() # Откатываем транзакцию в случае ошибки
+            print(f"Ошибка выполнения запроса: {e}")
+            print(f"Запрос: {query}")
+            print(f"Параметры: {params}")
+            # Можно перевыбросить ошибку или вернуть маркер ошибки
+            # raise e
+            return None # Или специфический маркер ошибки
 
-    def apply_promo_code(self, user_id: int, code: str):
-        valid, result = self.check_promo_valid(user_id, code)
-        if not valid:
-            return False, result
+    def executescript(self, script: str):
+         """Выполняет несколько SQL-запросов."""
+         conn = self._get_connection()
+         try:
+             with conn.cursor() as cur:
+                 cur.execute(script)
+             conn.commit()
+         except psycopg2.Error as e:
+             conn.rollback()
+             print(f"Ошибка выполнения скрипта: {e}")
+             # raise e
 
-        promo = result
-        self.conn.execute("""
-            INSERT INTO user_promos (user_id, promo_id, used_at)
-            VALUES (?, ?, ?)
-        """, (user_id, promo['id'], datetime.utcnow().isoformat()))
+    def close(self):
+        """Закрывает соединение с БД."""
+        if self._conn and self._conn.closed == 0:
+            self._conn.close()
+            print("Соединение с PostgreSQL закрыто")
 
-        self.conn.execute("""
-            UPDATE promo_achievements SET uses_left = uses_left - 1 WHERE id = ?
-        """, (promo['id'],))
+    # В классе DatabaseManager
 
-        self.conn.execute("""
-            UPDATE users SET coins = coins + ? WHERE user_id = ?
-        """, (promo['reward_amount'], user_id))
+    def create_tables(self):
+        """Создает все необходимые таблицы с нуля (если они не существуют)."""
+        script = """
+        -- Таблица карт
+        CREATE TABLE IF NOT EXISTS cards (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            rarity TEXT NOT NULL,
+            attack INTEGER NOT NULL,
+            health INTEGER NOT NULL,
+            value INTEGER NOT NULL,
+            image_path TEXT,
+            drop_weight INTEGER DEFAULT 1
+        );
 
-        self.conn.commit()
-        return True, f"Промокод успешно применён! Вы получили {promo['reward_amount']} 🪙."
+        -- Таблица кланов создается до таблицы пользователей
+        CREATE TABLE IF NOT EXISTS clans (
+            id SERIAL PRIMARY KEY,
+            name TEXT UNIQUE,
+            description TEXT,
+            points INTEGER DEFAULT 0,
+            rank INTEGER DEFAULT 0,
+            leader_id BIGINT -- FK constraint added later
+        );
 
-    def get_active_promos(self):
-        return self.conn.execute("""
-            SELECT * FROM promo_achievements WHERE uses_left > 0
-        """).fetchall()
+        -- Таблица пользователей
+        CREATE TABLE IF NOT EXISTS users (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            registered_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            clan_id INTEGER REFERENCES clans(id) ON DELETE SET NULL,
+            clan_role TEXT DEFAULT NULL,
+            has_battle_pass BOOLEAN NOT NULL DEFAULT FALSE,
+            rating INTEGER NOT NULL DEFAULT 0,
+            season_rating INTEGER NOT NULL DEFAULT 0,
+            coins INTEGER NOT NULL DEFAULT 0,
+            last_card_received TIMESTAMP WITH TIME ZONE,
+            referrals INTEGER NOT NULL DEFAULT 0,
+            total_cards_received INTEGER NOT NULL DEFAULT 0,
+            season_wins INTEGER NOT NULL DEFAULT 0,
+            season_losses INTEGER NOT NULL DEFAULT 0,
+            all_wins INTEGER NOT NULL DEFAULT 0,
+            all_losses INTEGER NOT NULL DEFAULT 0,
+            total_duplicates_received INTEGER NOT NULL DEFAULT 0,
+            shards INTEGER NOT NULL DEFAULT 0
+        );
 
-    def get_used_promos_by_user(self, user_id: int):
-        return self.conn.execute("""
-            SELECT p.* FROM promo_achievements p
-            JOIN user_promos u ON u.promo_id = p.id
-            WHERE u.user_id = ?
-        """, (user_id,)).fetchall()
+        -- Таблица колод пользователей - исправлена ссылка на user_id
+        CREATE TABLE IF NOT EXISTS user_decks (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT REFERENCES users(user_id) ON DELETE CASCADE,
+            card_id INTEGER REFERENCES cards(id) ON DELETE CASCADE,
+            position INTEGER NOT NULL, -- позиция карты в команде (1-5)
+            added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE (user_id, position) -- один пользователь не может иметь две карты на одной позиции
+        );
 
-# ---------------------- Пользователи ----------------------
+        -- Таблица карт пользователя
+        CREATE TABLE IF NOT EXISTS user_cards (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            card_id INTEGER NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+            amount INTEGER NOT NULL DEFAULT 1,
+            obtained_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            UNIQUE (user_id, card_id)
+        );
 
-    def register_user(self, user_id, username=None):
-        now = datetime.utcnow().isoformat()
-        self.conn.execute(
-            "INSERT OR IGNORE INTO users (user_id, username, registered_at) VALUES (?, ?, ?)",
-            (user_id, username, now)
-        )
-        self.conn.commit()
+        -- Таблица промокодов
+        CREATE TABLE IF NOT EXISTS promo_achievements (
+            id SERIAL PRIMARY KEY,
+            code TEXT UNIQUE,
+            reward_amount INTEGER NOT NULL, -- Награда в монетах
+            uses_left INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+        );
 
-    def get_user_info(self, user_id: int) -> Optional[UserProfile]:
-        cursor = self.conn.cursor()
+        -- Таблица использованных промокодов
+        CREATE TABLE IF NOT EXISTS user_promos (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            promo_id INTEGER NOT NULL REFERENCES promo_achievements(id) ON DELETE CASCADE,
+            used_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            UNIQUE(user_id, promo_id)
+        );
 
-        # Получаем имя пользователя и монеты
-        cursor.execute("SELECT username, coins, rating FROM users WHERE user_id = ?", (user_id,))
-        user_row = cursor.fetchone()
-        if user_row is None:
-            return None  # если пользователь не найден
+        -- === Таблицы для Ежедневных Заданий ===
 
-        # Получаем количество карт у пользователя
-        cursor.execute("SELECT COUNT(*) FROM user_cards WHERE user_id = ?", (user_id,))
-        cards_owned = cursor.fetchone()[0]
+        -- 1. Справочник заданий
+        CREATE TABLE IF NOT EXISTS daily_tasks (
+            id SERIAL PRIMARY KEY,
+            description TEXT NOT NULL, -- "Получи {target} обычные карты"
+            task_type TEXT NOT NULL, -- 'GET_RARITY_CARD', 'GET_ANY_CARD', 'INVITE_FRIEND'
+            target INTEGER NOT NULL,
+            rarity_condition TEXT DEFAULT NULL, -- 'common', 'rare', etc.
+            reward_shards INTEGER NOT NULL DEFAULT 5
+        );
 
-        # Получаем общее количество карт
-        cursor.execute("SELECT COUNT(*) FROM cards")
-        total_cards = cursor.fetchone()[0]
+        -- 2. Прогресс пользователя по заданиям
+        CREATE TABLE IF NOT EXISTS user_daily_tasks (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            task_id INTEGER NOT NULL REFERENCES daily_tasks(id) ON DELETE CASCADE,
+            progress INTEGER NOT NULL DEFAULT 0,
+            target INTEGER NOT NULL, -- Цель (дублируем для удобства)
+            completed BOOLEAN NOT NULL DEFAULT FALSE,
+            reward_claimed BOOLEAN NOT NULL DEFAULT FALSE, -- Получена ли награда за это задание
+            date DATE NOT NULL DEFAULT CURRENT_DATE,
+            UNIQUE (user_id, task_id, date) -- Уникальный прогресс по заданию на день
+        );
 
-        return UserProfile(
-            nickname=user_row["username"] or "User",
-            cards_owned=cards_owned,
-            total_cards=total_cards,
-            season_points=user_row["rating"],  # можно позже заменить, если появятся очки сезона
-            coins=user_row["coins"]
-        )
+        -- 3. Активные задания на день (для общего подхода)
+        CREATE TABLE IF NOT EXISTS daily_active_tasks (
+            date DATE PRIMARY KEY,
+            task_ids INTEGER[] NOT NULL -- Массив ID заданий из daily_tasks
+        );
 
-    def update_username(self, user_id, new_username):
-        self.conn.execute(
-            "UPDATE users SET username = ? WHERE user_id = ?",
-            (new_username, user_id)
-        )
-        self.conn.commit()
+        -- 4. Отметка получения бонуса за все задания дня
+        CREATE TABLE IF NOT EXISTS daily_bonus_claimed (
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            date DATE NOT NULL DEFAULT CURRENT_DATE,
+            claimed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            PRIMARY KEY (user_id, date)
+        );
 
-    def update_rating(self, user_id, new_rating):
-        self.conn.execute(
-            "UPDATE users SET rating = ? WHERE user_id = ?",
-            (new_rating, user_id)
-        )
-        self.conn.commit()
+        -- === Индексы ===
+        CREATE INDEX IF NOT EXISTS idx_user_decks_user_id ON user_decks(user_id);
+        CREATE INDEX IF NOT EXISTS idx_user_decks_card_id ON user_decks(card_id);
+        CREATE INDEX IF NOT EXISTS idx_user_cards_user_id ON user_cards(user_id);
+        CREATE INDEX IF NOT EXISTS idx_users_clan_id ON users(clan_id);
+        CREATE INDEX IF NOT EXISTS idx_user_daily_tasks_user_date ON user_daily_tasks(user_id, date);
+        CREATE INDEX IF NOT EXISTS idx_promo_achievements_code ON promo_achievements(code);
+        CREATE INDEX IF NOT EXISTS idx_daily_tasks_type ON daily_tasks(task_type); -- Для TaskManager
+        """
 
-    def set_battle_pass(self, user_id, has_pass):
-        self.conn.execute(
-            "UPDATE users SET has_battle_pass = ? WHERE user_id = ?",
-            (int(has_pass), user_id)
-        )
-        self.conn.commit()
+        # Выполняем весь скрипт создания таблиц
+        self.executescript(script)
+        print("Создание базовых таблиц и таблиц заданий выполнено.")
 
-    def add_referral(self, user_id):
-        self.conn.execute(
-            "UPDATE users SET referrals = referrals + 1 WHERE user_id = ?",
-            (user_id,)
-        )
-        self.conn.commit()
+        # --- Добавляем внешний ключ для clans.leader_id ---
+        # Добавляем проверку существования таблицы clans
+        check_clans = self.execute("SELECT to_regclass('public.clans') IS NOT NULL AS exists", fetch='one')
 
-    def add_poti_coins(self, user_id, amount):
-        self.conn.execute(
-            "UPDATE users SET coins = coins + ? WHERE user_id = ?",
-            (amount, user_id)
-        )
-        self.conn.commit()
-
-    def get_user_poti_coins(self, user_id):
-        result = self.conn.execute(
-            "SELECT coins FROM users WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-        if result:
-            return result['coins']
-        return 0
-
-    def spend_poti_coin(self, user_id, amount):
-        current_coins = self.get_user_poti_coins(user_id)
-        if current_coins >= amount:
-            self.conn.execute(
-                "UPDATE users SET coins = coins - ? WHERE user_id = ?",
-                (amount, user_id)
-            )
-            self.conn.commit()
-            return True
-        return False
-
-
-# ---------------------- Карты ----------------------
-
-    def can_receive_card(self, user_id):
-        result = self.conn.execute(
-            "SELECT last_card_received FROM users WHERE user_id = ?",
-            (user_id,)
-        ).fetchone()
-        if not result or result['last_card_received'] is None:
-            return True
-        last_time = datetime.fromisoformat(result['last_card_received'])
-        return datetime.utcnow() - last_time >= timedelta(hours=4)
-
-    def reset_last_received_time(self, user_id):
-        new_time = datetime.utcnow() - timedelta(hours=5)
-        self.conn.execute(
-            "UPDATE users SET last_card_received = ? WHERE user_id = ?",
-            (new_time.isoformat(), user_id)
-        )
-        self.conn.commit()
-
-    def give_card_to_user(self, user_id, card_id):
-        now = datetime.utcnow().isoformat()
-        existing = self.conn.execute(
-            "SELECT id, amount FROM user_cards WHERE user_id = ? AND card_id = ?",
-            (user_id, card_id)
-        ).fetchone()
-
-        if existing:
-            self.conn.execute(
-                "UPDATE user_cards SET amount = amount + 1, obtained_at = ? WHERE id = ?",
-                (now, existing['id'])
-            )
+        if check_clans and check_clans['exists']:
+            self.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1 FROM information_schema.table_constraints
+                    WHERE constraint_name = 'fk_clans_leader' AND table_name = 'clans'
+                ) THEN
+                    ALTER TABLE clans ADD CONSTRAINT fk_clans_leader
+                    FOREIGN KEY (leader_id) REFERENCES users(user_id) ON DELETE SET NULL;
+                    RAISE NOTICE 'Добавлен внешний ключ fk_clans_leader.';
+                ELSE
+                    RAISE NOTICE 'Внешний ключ fk_clans_leader уже существует.';
+                END IF;
+            END $$;
+            """)
+            print("Внешний ключ для clans.leader_id обработан.")
         else:
-            self.conn.execute(
-                "INSERT INTO user_cards (user_id, card_id, amount, obtained_at) VALUES (?, ?, ?, ?)",
-                (user_id, card_id, 1, now)
-            )
+            print("Таблица clans не найдена, пропуск добавления внешнего ключа.")
 
-        self.conn.execute(
-            "UPDATE users SET last_card_received = ? WHERE user_id = ?",
-            (now, user_id)
-        )
-        self.conn.commit()
+        print("--- Проверка и создание всех таблиц завершены ---")
 
-    def get_random_card(self, user_id=None, exclude_received=True):
-        query = "SELECT * FROM cards"
-        params = []
+db = DatabaseManager(DSN)
 
-        if exclude_received and user_id is not None:
-            query += " WHERE id NOT IN (SELECT card_id FROM user_cards WHERE user_id = ?)"
-            params.append(user_id)
-
-        cards = self.conn.execute(query, params).fetchall()
-        if not cards:
-            return None
-
-        weights = [RARITY_WEIGHTS.get(card['rarity'], 1) for card in cards]
-        return random.choices(cards, weights=weights, k=1)[0]
-
-    def remove_card_from_user(self, user_id, card_id):
-        existing = self.conn.execute(
-            "SELECT id, amount FROM user_cards WHERE user_id = ? AND card_id = ?",
-            (user_id, card_id)
-        ).fetchone()
-
-        if existing:
-            if existing['amount'] > 1:
-                self.conn.execute(
-                    "UPDATE user_cards SET amount = amount - 1 WHERE id = ?",
-                    (existing['id'],)
-                )
-            else:
-                self.conn.execute(
-                    "DELETE FROM user_cards WHERE id = ?",
-                    (existing['id'],)
-                )
-            self.conn.commit()
-
-    def add_card(self, name, rarity, attack, health, value, image_path=None):
-        drop_weight = RARITY_WEIGHTS.get(rarity, 1)
-        self.conn.execute(
-            """
-            INSERT INTO cards (name, rarity, attack, health, value, image_path, drop_weight)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (name, rarity, attack, health, value, image_path, drop_weight)
-        )
-        self.conn.commit()
-
-    def get_all_cards(self):
-        return self.conn.execute("SELECT * FROM cards").fetchall()
-
-    def get_user_cards(self, user_id):
-        return self.conn.execute(
-            "SELECT * FROM user_cards WHERE user_id = ?",
-            (user_id,)
-        ).fetchall()
-
-    def edit_card(self, card_id, name=None, rarity=None, attack=None, health=None, value=None, image_path=None):
-        card = self.conn.execute("SELECT * FROM cards WHERE id = ?", (card_id,)).fetchone()
-        if not card:
-            return
-
-        name = name or card['name']
-        rarity = rarity or card['rarity']
-        attack = attack if attack is not None else card['attack']
-        health = health if health is not None else card['health']
-        value = value if value is not None else card['value']
-        image_path = image_path or card['image_path']
-        drop_weight = RARITY_WEIGHTS.get(rarity, 1)
-
-        self.conn.execute(
-            """
-            UPDATE cards
-            SET name = ?, rarity = ?, attack = ?, health = ?, value = ?, image_path = ?, drop_weight = ?
-            WHERE id = ?
-            """,
-            (name, rarity, attack, health, value, image_path, drop_weight, card_id)
-        )
-        self.conn.commit()
-
-
-# ---------------------- Кланы ----------------------
-
-    def get_clan_info(self, clan_id):
-        clan = self.conn.execute("SELECT * FROM clans WHERE id = ?", (clan_id,)).fetchone()
-        if not clan:
-            return None
-
-        leader = self.conn.execute("SELECT username FROM users WHERE user_id = ?", (clan['leader_id'],)).fetchone()
-
-        members = self.conn.execute(
-            "SELECT user_id, username, rating, clan_role FROM users WHERE clan_id = ? ORDER BY rating DESC",
-            (clan_id,)
-        ).fetchall()
-
-        deputies = [
-            {"user_id": m["user_id"], "username": m["username"]}
-            for m in members if m["clan_role"] == "deputy"
-        ]
-
-        return {
-            "id": clan["id"],
-            "name": clan["name"],
-            "description": clan["description"],
-            "points": clan["points"],
-            "rank": clan["rank"],
-            "leader": leader["username"] if leader else None,
-            "deputies": deputies,
-            "top7": [{"user_id": m["user_id"], "username": m["username"], "rating": m["rating"]} for m in members[:7]],
-            "members_count": len(members)
-        }
-
-    def get_top_clans(self, limit=10):
-        clans = self.conn.execute(
-            """
-            SELECT 
-                c.id, 
-                c.name, 
-                c.points, 
-                c.rank,
-                (SELECT COUNT(*) FROM users u WHERE u.clan_id = c.id) as members_count
-            FROM clans c
-            ORDER BY c.points DESC
-            LIMIT ?
-            """,
-            (limit,)
-        ).fetchall()
-
-        return [
-            {
-                "id": clan["id"],
-                "name": clan["name"],
-                "points": clan["points"],
-                "rank": clan["rank"],
-                "members_count": clan["members_count"]
-            }
-            for clan in clans
-        ]
-
-    def add_user_to_clan(self, user_id, clan_id):
-        self.conn.execute(
-            "UPDATE users SET clan_id = ?, clan_role = 'member' WHERE user_id = ?",
-            (clan_id, user_id)
-        )
-        self.conn.commit()
-
-    def promote_to_deputy(self, user_id):
-        self.conn.execute(
-            "UPDATE users SET clan_role = 'deputy' WHERE user_id = ?",
-            (user_id,)
-        )
-        self.conn.commit()
-
-    def remove_user_from_clan(self, user_id):
-        self.conn.execute(
-            "UPDATE users SET clan_id = NULL, clan_role = NULL WHERE user_id = ?",
-            (user_id,)
-        )
-        self.conn.commit()
-
-db = CardDatabase()
+if __name__ == '__main__':
+    pass
+    #
+    #     # --- Работа с пользователями ---
+    #     print("\n--- Пользователи ---")
+    #     user_id_1 = 1001
+    #     user_id_2 = 1002
+    #     user_manager.register_user(user_id_1, "Alice")
+    #     user_manager.register_user(user_id_2, "Bob")
+    #     print(f"Профиль Alice: {user_manager.get_user_info(user_id_1)}")
+    #     user_manager.add_coins(user_id_1, 50)
+    #     print(f"Монеты Alice: {user_manager.get_coins(user_id_1)}")
+    #     if user_manager.spend_coins(user_id_1, 20):
+    #          print("Alice потратила 20 монет.")
+    #     else:
+    #          print("У Alice не хватило монет.")
+    #     print(f"Монеты Alice после траты: {user_manager.get_coins(user_id_1)}")
+    #
+    #     # --- Работа с картами ---
+    #     print("\n--- Карты ---")
+    #     # Добавим пару карт, если их нет
+    #     if not card_manager.get_all_cards():
+    #          card1_id = card_manager.add_card("Warrior", "common", 10, 5, 100)
+    #          card2_id = card_manager.add_card("Mage", "rare", 5, 10, 250)
+    #          print(f"Добавлены карты с ID: {card1_id}, {card2_id}")
+    #     else:
+    #          cards_list = card_manager.get_all_cards()
+    #          card1_id = cards_list[0]['id']
+    #          card2_id = cards_list[1]['id'] if len(cards_list) > 1 else card1_id
+    #
+    #
+    #     if card_manager.can_receive_card(user_id_1):
+    #         random_card = card_manager.get_random_card()
+    #         if random_card:
+    #              print(f"Alice может получить карту. Выпала: {random_card['name']}")
+    #              card_manager.give_card_to_user(user_id_1, random_card['id'])
+    #              print(f"Карты Alice: {card_manager.get_user_cards(user_id_1)}")
+    #         else:
+    #              print("Нет доступных карт для выдачи.")
+    #     else:
+    #         print("Alice еще не может получить карту (кулдаун).")
+    #
+    #     # --- Работа с кланами ---
+    #     print("\n--- Кланы ---")
+    #     # Создадим клан, если у Боба его нет
+    #     bob_info = user_manager.get_user_info(user_id_2)
+    #     if bob_info and bob_info.clan_name is None:
+    #          clan_id = clan_manager.create_clan("Dragons", user_id_2, "Mighty clan")
+    #          if clan_id:
+    #               print(f"Создан клан Dragons (ID: {clan_id})")
+    #               # Добавим Алису в клан
+    #               clan_manager.add_user_to_clan(user_id_1, clan_id)
+    #               print("Алиса добавлена в клан Dragons")
+    #               # Повысим Алису
+    #               clan_manager.set_clan_role(user_id_1, clan_id, "deputy")
+    #               print("Алиса повышена до deputy")
+    #
+    #               print(f"Инфо о клане Dragons: {clan_manager.get_clan_info(clan_id)}")
+    #          else:
+    #               print("Не удалось создать клан (возможно, имя занято).")
+    #     else:
+    #          print("Боб уже в клане или не зарегистрирован.")
+    #
+    #     print(f"Топ кланов: {clan_manager.get_top_clans()}")
+    #
+    #
+    #     # --- Работа с промокодами ---
+    #     print("\n--- Промокоды ---")
+    #     promo = promo_manager.generate_promo_code(reward_amount=100, uses=2, custom_code="WELCOME100")
+    #     if promo:
+    #         print(f"Сгенерирован промокод: {promo}")
+    #
+    #         # Алиса применяет промокод
+    #         success, message = promo_manager.apply_promo_code(user_id_1, promo)
+    #         print(f"Алиса применяет {promo}: {message}")
+    #
+    #         # Боб применяет промокод
+    #         success, message = promo_manager.apply_promo_code(user_id_2, promo)
+    #         print(f"Боб применяет {promo}: {message}")
+    #
+    #         # Третья попытка (должна быть неудачной)
+    #         success, message = promo_manager.apply_promo_code(9999, promo) # Несуществующий юзер
+    #         print(f"Третья попытка применить {promo}: {message}") # Ошибка, т.к. кончились использования
+    #
+    #         print(f"Активные промо: {promo_manager.get_active_promos()}")
+    #         print(f"Промо Алисы: {promo_manager.get_used_promos_by_user(user_id_1)}")
+    #
+    # except psycopg2.OperationalError as e:
+    #     print(f"Критическая ошибка подключения к БД. Проверьте настройки DSN. Ошибка: {e}")
+    # except Exception as e:
+    #     print(f"Произошла непредвиденная ошибка: {e}")
+    # finally:
+    #     # Закрываем соединение при выходе
+    #     if 'db_manager' in locals() and db:
+    #         db.close()

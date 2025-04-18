@@ -1,16 +1,10 @@
 import random
 from faker import Faker
-from card_database import CardDatabase
+
+from bot.Classes.db_manager import card_manager
+from bot.card_database import RARITY_WEIGHTS
 
 fake = Faker()
-
-RARITIES = [
-    ("common", 50),
-    ("uncommon", 30),
-    ("rare", 15),
-    ("epic", 4),
-    ("legendary", 1)
-]
 
 PHOTO_IDS = [
     "AgACAgIAAxkBAAIU52f70W55hcDTdQj05bpcvKRiQ87PAAKr7TEbOA7ZS96RJgrwky0RAQADAgADcwADNgQ",
@@ -23,13 +17,13 @@ PHOTO_IDS = [
 ]
 
 def weighted_rarity():
-    names = [r[0] for r in RARITIES]
-    weights = [r[1] for r in RARITIES]
+    names = list(RARITY_WEIGHTS.keys())
+    weights = list(RARITY_WEIGHTS.values())
     return random.choices(names, weights=weights, k=1)[0]
 
 def generate_random_cards(amount):
-    db = CardDatabase()
     for _ in range(amount):
+
         name = fake.first_name() + " " + fake.last_name()
         rarity = weighted_rarity()
 
@@ -37,10 +31,10 @@ def generate_random_cards(amount):
         base_health = random.randint(1000, 2000)
         multiplier = {
             "common": 1,
-            "uncommon": 1.5,
             "rare": 2,
             "epic": 3,
-            "legendary": 5
+            "legendary": 5,
+            "mythical": 10
         }.get(rarity, 1)
 
         attack = int(base_attack * multiplier)
@@ -49,7 +43,7 @@ def generate_random_cards(amount):
 
         photo_id = random.choice(PHOTO_IDS)
 
-        db.add_card(name=name, rarity=rarity, attack=attack, health=health, value=value, image_path=photo_id)
+        card_manager.add_card(name=name, rarity=rarity, attack=attack, health=health, value=value, image_path=photo_id)
 
 if __name__ == "__main__":
     generate_random_cards(20)  # Пример: сгенерировать 20 карт
