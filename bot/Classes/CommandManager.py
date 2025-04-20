@@ -1,5 +1,5 @@
 from typing import List, Tuple, Dict, Optional, Union
-from bot.card_database import DatabaseManager, rarity_translate
+from bot.card_database import DatabaseManager, rarity_translate, DeckProfile
 
 RARITY_EMOJIS = {
     "обычная": ["⚪", "обычная"],
@@ -41,6 +41,7 @@ class CommandManager:
             fetch='all'
         )
         if rows:
+
             return [dict(row) for row in rows]
         else:
             return None
@@ -62,7 +63,7 @@ class CommandManager:
         """, (user_id, position))
 
     # Посчитать суммарные характеристики команды
-    def get_team_stats(self, user_id: int) -> Optional[Dict[str, int]]:
+    def get_team_stats(self, user_id: int) -> Optional[DeckProfile]:
         row = self.db.execute("""
             SELECT 
                 COALESCE(SUM(c.attack), 0) as total_attack,
@@ -72,4 +73,11 @@ class CommandManager:
             JOIN user_decks ud ON c.id = ud.card_id
             WHERE ud.user_id = %s;
         """, (user_id,), fetch='one')
-        return dict(row) if row else None
+        if row:
+            deck = DeckProfile(
+                attack=row["total_attack"],
+                health=row["total_health"],
+                value=row["total_value"]
+            )
+            return deck
+        else: return None

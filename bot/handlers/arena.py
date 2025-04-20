@@ -1,7 +1,9 @@
 from collections import deque
 import asyncio
+from random import choice
 
 from aiogram.exceptions import TelegramBadRequest
+from aiogram.fsm.state import StatesGroup, State
 
 from bot.Classes.CommandManager import RARITY_EMOJIS
 from bot.card_database import rarity_translate
@@ -20,6 +22,11 @@ from bot.Classes.db_manager import task_manager, user_manager, command_manager, 
 arena_handler = Router()
 
 
+class BattleState(StatesGroup):
+    InBattle = State()
+
+BATTLE_REWARD_SHARDS = 10
+
 CARDS_PER_PAGE = 4
 
 
@@ -36,7 +43,7 @@ async def find_opponent_callback(callback: CallbackQuery, state: FSMContext): # 
     await callback.answer("Ищем соперника...") # Ответ на нажатие кнопки
 
     async with matchmaking_lock:
-        if user_id in [u_id for u_id, u_name in matchmaking_queue]:
+        if user_id in [u_id for u_id, u_name, _ in matchmaking_queue]:
              await callback.message.edit_text("Вы уже в очереди!") # Редактируем исходное сообщение
              return
 
@@ -60,7 +67,7 @@ async def find_opponent_callback(callback: CallbackQuery, state: FSMContext): # 
             # await bot.send_message(opponent_id, f"Найден соперник: {user_name}!") # Отправляем другому
             await callback.message.answer("⏳ Поиск соперника... Ожидайте.")
 
-            await start_battle(user_id, opponent_id, callback.message.chat.id, opponent_chat_id, user_name, opponent_name, state, db)
+            await start_battle(user_id, opponent_id, callback.message.chat.id, opponent_chat_id, user_name, opponent_name, state)
 
         else:
             # --- Добавляем в очередь ---
@@ -70,7 +77,7 @@ async def find_opponent_callback(callback: CallbackQuery, state: FSMContext): # 
             waiting_messages[user_id] = msg.message_id
             print(f"User {user_id} ({user_name}) added to matchmaking queue.")
 
-async def start_battle(user_id, opponent_id, user_chat_id, opponent_chat_id, user_name, opponent_name, state, db_manager):
+async def start_battle(user_id, opponent_id, user_chat_id, opponent_chat_id, user_name, opponent_name, state):
     # TODO: Доделать собственно
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -78,34 +85,206 @@ async def start_battle(user_id, opponent_id, user_chat_id, opponent_chat_id, use
             InlineKeyboardButton(text="▶️ Пропустить", callback_data="battle_skip")
         ]
     ])
+    
     p1_key = StorageKey(bot_id=bot.id, chat_id=user_chat_id, user_id=user_id)
     p2_key = StorageKey(bot_id=bot.id, chat_id=opponent_chat_id, user_id=opponent_id)
+    
+    user_data = command_manager.get_team_stats(user_id)
+    opponent_data = command_manager.get_team_stats(opponent_id)
 
-    user_data = user_manager.get_user_info(user_id)
-    opponent_data = user_manager.get_user_info(opponent_id)
-    battle_data = {
-        "p1_id": user_id,
-        "p2_id": opponent_id,
-        "health_p1": health_p1,
-        "health_p2": health_p2,
-        "damage_p1": damage,
-        "damage_p2": damage,
-        "round": round_num
+    p1_wins_instantly = user_data.attack >= opponent_data.health
+    p2_wins_instantly = opponent_data.attack >= user_data.health
+
+    if p1_wins_instantly and p2_wins_instantly:
+        # Ничья или кто первый ударил? Для простоты - ничья, без наград/статистики
+        await bot.send_message(user_id, f"⚔️ Битва с {opponent_name}!\nМгновенная ничья! Оба игрока слишком сильны!")
+        await bot.send_message(opponent_id, f"⚔️ Битва с {user_name}!\nМгновенная ничья! Оба игрока слишком сильны!")
+        return  # Завершаем без статистики
+    elif p1_wins_instantly:
+        battle_data = {  # Данные для сообщения о результате
+            "p1_id": user_id, "p2_id": opponent_id, "p1_name": user_name, "p2_name": opponent_name,
+            "p1_atk": user_data.attack, "p2_atk": opponent_data.attack, "initial_p1_hp": user_data.health, "initial_p2_hp": opponent_data.health,
+            "final_p1_hp": user_data.health, "final_p2_hp": 0,  # Проигравший на 0 хп
+            "damage_dealt_by_winner": user_data.attack, "damage_dealt_by_loser": 0, "rounds": 1
+        }
+        await end_battle(user_id, opponent_id, state, p1_key, p2_key, battle_data)  # user_manager нужен для наград
+        return
+    elif p2_wins_instantly:
+        battle_data = {
+            "p1_id": user_id, "p2_id": opponent_id, "p1_name": user_name, "p2_name": opponent_name,
+            "p1_atk": user_data.attack, "p2_atk": opponent_data.attack, "initial_p1_hp": user_data.health, "initial_p2_hp": opponent_data.health,
+            "final_p1_hp": 0, "final_p2_hp": opponent_data.health,
+            "damage_dealt_by_winner": opponent_data.attack, "damage_dealt_by_loser": 0, "rounds": 1
+        }
+        await end_battle(opponent_id, user_id, state, p2_key, p1_key, battle_data)
+        return
+
+    first_turn_player_id = choice([user_id, opponent_id])
+
+    initial_battle_data = {
+        "opponent_id": opponent_id,
+        "opponent_chat_id": opponent_chat_id,
+        "opponent_name": opponent_name,
+        "my_hp": user_data.health,
+        "my_atk": user_data.attack,
+        "opponent_hp": opponent_data.health,
+        "opponent_atk": opponent_data.attack,
+        "current_turn": first_turn_player_id,
+        "round": 1,
+        "initial_my_hp": user_data.health,
+        "initial_opponent_hp": opponent_data.health,
+        "total_my_damage": 0,
+        "total_opponent_damage": 0,
+        "last_log_message": None
     }
-    text = (f"🗡 <b>Сражение между игроками</b> {user_name} и {opponent_name}\n"
-        f"⠀\n"
-        f"✳ <b>Раунд round_num</b> ✳\n"
-        f"👱‍♂️ {user_name}\n"
-        f"┗ Наносит ⚔ <b>{attacker_damage} урона</b>\n"
-        f"{opponent_name}\n"
-        f"┗ {{[❤️{defender_hp}]}} ⟶ {{[💔{defender_hp_after}]}}\n"
-        f"⠀\n"
-        f"🧑‍🦱 {opponent_name}\n"
-        f"┗ Наносит ⚔ <b>{defender_damage} урона</b>\n"
-        f"{user_name}\n"
-        f"┗ {{[❤️{attacker_hp}]}} ⟶ {{[💔{attacker_hp_after}]}}")
-    await bot.send_message(user_id, "lets go")
-    await bot.send_message(opponent_id, "lets go")
+
+    await state.storage.set_state(key=p1_key, state=BattleState.InBattle)
+    await state.storage.set_data(key=p1_key, data=initial_battle_data)
+
+    # Зеркальные данные для оппонента
+    initial_battle_data_opponent = {
+        "opponent_id": user_id,
+        "opponent_chat_id": user_chat_id,
+        "opponent_name": user_name,
+        "my_hp": opponent_data.health,
+        "my_atk": opponent_data.attack,
+        "opponent_hp": user_data.health,
+        "opponent_atk": user_data.attack,
+        "current_turn": first_turn_player_id,
+        "round": 1,
+        "initial_my_hp": opponent_data.health,
+        "initial_opponent_hp": user_data.health,
+        "total_my_damage": 0,
+        "total_opponent_damage": 0,
+        "last_log_message": None
+    }
+
+    await state.storage.set_state(key=p2_key, state=BattleState.InBattle)
+    await state.storage.set_data(key=p2_key, data=initial_battle_data_opponent)
+
+    await send_battle_turn_message(user_id, p1_key, state)
+    await send_battle_turn_message(opponent_id, p2_key, state)  # Функция сама определит, чей ход
+
+def get_battle_keyboard(my_turn: bool, opponent_id: int) -> InlineKeyboardMarkup:
+    if not my_turn: # Если не наш ход, кнопок нет
+        buttons = [
+            [InlineKeyboardButton(text="⏳ Ждите своего хода", callback_data=f"wait")]
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=buttons)
+    buttons = [
+        [InlineKeyboardButton(text="⚔️ Атака", callback_data=f"battle_attack:{opponent_id}")],
+        [InlineKeyboardButton(text="⏳ Пропустить", callback_data=f"battle_skip:{opponent_id}")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+async def send_battle_turn_message(user_id: int, key: StorageKey, state: FSMContext,):
+    # Получаем текущее состояние боя для этого игрока
+    user_state_data = await state.storage.get_data(key=key)
+    if not user_state_data: return  # Состояния нет
+
+    my_turn = user_state_data['current_turn'] == user_id
+    my_hp = user_state_data['my_hp']
+    opponent_hp = user_state_data['opponent_hp']
+    opponent_name = user_state_data['opponent_name']
+    opponent_id = user_state_data['opponent_id']
+    round_num = user_state_data['round']
+
+    text = (
+        f"⛩️ Раунд {round_num}\n\n"
+        f"👤 {opponent_name}: ❤️{opponent_hp}\n"
+        f"🙍‍♂️ Вы: ❤️{my_hp}\n\n"
+    )
+    if my_turn:
+        text += "🔥 Ваш ход!"
+    else:
+        text += f"⏳ Ожидание хода {opponent_name}..."
+
+    keyboard = get_battle_keyboard(my_turn, opponent_id)
+
+    # Пытаемся отредактировать предыдущее сообщение боя, если возможно
+    # Нужно хранить message_id в FSM или использовать edit_message_text по callback.message
+    # Для простоты пока отправляем новое сообщение
+    await bot.send_message(user_id, text, reply_markup=keyboard)
+
+async def end_battle(winner_id: int, loser_id: int, state: FSMContext, winner_key: StorageKey, loser_key: StorageKey, battle_data: dict):
+    winner_name = battle_data['p1_name'] if battle_data['p1_id'] == winner_id else battle_data['p2_name']
+    loser_name = battle_data['p2_name'] if battle_data['p1_id'] == winner_id else battle_data['p1_name']
+
+    # todo засчитывание победы в статистику
+    # try:
+    #     with conn.cursor() as cur:
+    #         # Увеличиваем победы победителю
+    #         cur.execute("UPDATE users SET season_wins = season_wins + 1 WHERE user_id = %s", (winner_id,))
+    #         # Увеличиваем поражения проигравшему
+    #         cur.execute("UPDATE users SET season_losses = season_losses + 1 WHERE user_id = %s", (loser_id,))
+    #         # Выдаем награду победителю
+    #         user_manager.add_shards(winner_id, BATTLE_REWARD_SHARDS, cursor=cur)
+    #     conn.commit()
+    #     print(f"Stats updated for battle between {winner_id} and {loser_id}")
+    # except Exception as e:
+    #     conn.rollback()
+    #     print(f"Error updating stats/rewards after battle: {e}")
+
+    # --- Формируем финальное сообщение ---
+    # Определяем, кто был P1, кто P2 в терминах battle_data
+    p1_data_key = 'p1' if battle_data['p1_id'] == winner_id else 'p2'
+    p2_data_key = 'p2' if battle_data['p1_id'] == winner_id else 'p1'
+
+    winner_log_name = battle_data[f'{p1_data_key}_name']
+    loser_log_name = battle_data[f'{p2_data_key}_name']
+    winner_damage = battle_data['damage_dealt_by_winner']
+    loser_damage = battle_data['damage_dealt_by_loser']
+    loser_hp_before = battle_data[f'initial_{p2_data_key}_hp']
+    loser_hp_after = battle_data[f'final_{p2_data_key}_hp'] # Должен быть <= 0
+    winner_hp_final = battle_data[f'final_{p1_data_key}_hp'] # ХП победителя
+    rounds = battle_data['rounds']
+
+    # Ссылка на профиль проигравшего (для победителя)
+    loser_tg_link = f"(tg://user?id={loser_id})" # Было tg://openmessage?user_id={loser_id}, но tg://user стандартнее
+
+    result_message = f"""
+🌄🌋 Сражение между игроками {winner_name} и {loser_name} {loser_tg_link}
+
+✨ Победа! ✨
+
+🙍‍♂️ {winner_name} (❤️{winner_hp_final})
+\t\t┗⊳ Наносит ⚔️{winner_damage} урона
+
+👤 {loser_name}
+\t\t┗⊳〘💔{loser_hp_before}〙➠〘☠️{max(0, loser_hp_after)}〙
+
+🗡️ Всего урона нанесено: {winner_damage}
+🦴 Урона получено: {loser_damage}
+⛩️ Всего раундов: {rounds}
+
+🌺 Держи свою награду за победу
+\t +{BATTLE_REWARD_SHARDS}🀄️ осколка
+"""
+
+    # --- Отправляем результат и сохраняем лог ---
+    try:
+        await bot.send_message(winner_id, result_message)
+        # Отправляем проигравшему немного измененное сообщение
+        result_message_loser = result_message.replace(f"✨ Победа! ✨", "🚫 Поражение! 🚫")
+        result_message_loser = result_message_loser.replace("🌺 Держи свою награду за победу", " ") # Убираем строку с наградой
+        result_message_loser = result_message_loser.replace(f"\t +{BATTLE_REWARD_SHARDS}🀄️ осколка", "")
+        await bot.send_message(loser_id, result_message_loser)
+
+        # Сохраняем лог в FSM (для команды /lastbattle)
+        await state.storage.update_data(key=winner_key, data={"last_log_message": result_message})
+        await state.storage.update_data(key=loser_key, data={"last_log_message": result_message_loser})
+
+    except Exception as e:
+        print(f"Error sending final battle messages: {e}")
+
+    # --- Очищаем состояние FSM для обоих игроков ---
+    await state.storage.set_state(key=winner_key, state=None)
+    await state.storage.set_state(key=loser_key, state=None)
+    # Данные можно не чистить явно, если используем MemoryStorage, но для Redis лучше чистить
+    # await state.storage.set_data(key=f'fsm:{winner_id}:{winner_id}', data={})
+    # await state.storage.set_data(key=f'fsm:{loser_id}:{loser_id}', data={})
+    print(f"FSM state cleared for users {winner_id} and {loser_id}")
+
 
 @arena_handler.callback_query(F.data.startswith("cancel_match"))
 async def show_rarity_cards(call: CallbackQuery):
@@ -118,8 +297,8 @@ async def show_arena_menu(call: CallbackQuery):
     team = command_manager.format_user_team(call.from_user.id)
     all_stats = command_manager.get_team_stats(call.from_user.id)
 
-    attack = all_stats.get("total_attack")
-    health = all_stats.get("total_health")
+    attack = all_stats.attack
+    health = all_stats.health
 
     team_text = (f"┏➤{team[0][0]} {team[0][1]}\n"
                  f"┣➤{team[1][0]} {team[1][1]}\n"
@@ -152,6 +331,113 @@ async def show_arena_menu(call: CallbackQuery):
 
     await call.message.edit_text(text, reply_markup=keyboard)
 
+@arena_handler.callback_query(F.data.startswith("battle_attack:"), BattleState.InBattle)
+async def battle_attack_callback(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    target_opponent_id = int(callback.data.split(":")[1])
+
+    p1_key = StorageKey(bot_id=bot.id, chat_id=callback.message.chat.id, user_id=user_id)
+
+    attacker_data = await state.storage.get_data(p1_key)
+
+    p2_key = StorageKey(bot_id=bot.id, chat_id=attacker_data.get("opponent_chat_id"), user_id=attacker_data.get("opponent_id"))
+
+
+    # Проверки
+    if not attacker_data: return await callback.answer("Ошибка: Состояние боя не найдено.", show_alert=True)
+    if attacker_data['current_turn'] != user_id: return await callback.answer("Сейчас не ваш ход!", show_alert=True)
+    if attacker_data['opponent_id'] != target_opponent_id: return await callback.answer("Ошибка: Неверная цель атаки.", show_alert=True)
+
+    await callback.answer("Атакуем...") # Ответ на кнопку
+
+    # Данные для обновления
+    defender_id = target_opponent_id
+    damage = attacker_data['my_atk']
+    attacker_data['total_my_damage'] += damage # Обновляем суммарный урон
+
+    # Получаем состояние защищающегося, чтобы обновить его HP
+    defender_data = await state.storage.get_data(key=p2_key)
+    if not defender_data: return # Ошибка, бой должен прекратиться?
+
+    new_defender_hp = defender_data['my_hp'] - damage
+    defender_data['my_hp'] = new_defender_hp
+    defender_data['total_opponent_damage'] += damage # Урон, полученный защищающимся
+
+    # Обновляем данные FSM для обоих
+    await state.storage.set_data(key=p1_key, data=attacker_data)
+    await state.storage.set_data(key=p2_key, data=defender_data)
+
+    # --- Проверяем конец боя ---
+    if new_defender_hp <= 0:
+        print(f"Battle end: {user_id} defeated {defender_id}")
+        # Собираем финальные данные
+        final_data = {
+            "p1_id": user_id, "p2_id": defender_id,
+            "p1_name": callback.from_user.first_name, # Получаем имена снова или храним в FSM
+            "p2_name": defender_data['opponent_name'],
+            "p1_atk": attacker_data['my_atk'], "p2_atk": defender_data['my_atk'],
+            "initial_p1_hp": attacker_data['initial_my_hp'], "initial_p2_hp": defender_data['initial_my_hp'],
+            "final_p1_hp": attacker_data['my_hp'], "final_p2_hp": max(0, new_defender_hp), # Не уходим в минус в логе
+            "damage_dealt_by_winner": attacker_data['total_my_damage'],
+            "damage_dealt_by_loser": defender_data['total_my_damage'],
+            "rounds": attacker_data['round']
+        }
+        await end_battle(user_id, defender_id, state, p1_key, p2_key, final_data)
+    else:
+        # --- Бой продолжается, передаем ход ---
+        attacker_data['current_turn'] = defender_id
+        defender_data['current_turn'] = defender_id # Оба знают, чей ход
+        # Увеличиваем раунд, если ход вернулся к P1 (или просто после хода P2)
+        # Проще увеличивать каждый раз, когда ходит второй игрок
+        # Или после каждого хода p2
+        if attacker_data['opponent_id'] == defender_id: # Если p2 ходил
+             defender_data['round'] += 1
+             attacker_data['round'] = defender_data['round'] # Синхронизируем раунд
+
+
+        # Обновляем данные FSM
+        await state.storage.set_data(key=p1_key, data=attacker_data)
+        await state.storage.set_data(key=p2_key, data=defender_data)
+
+        # Обновляем сообщения для обоих игроков
+        await send_battle_turn_message(user_id, p1_key, state)
+        await send_battle_turn_message(defender_id, p2_key, state)
+
+
+@arena_handler.callback_query(F.data.startswith("battle_skip:"), BattleState.InBattle)
+async def battle_skip_callback(callback: CallbackQuery, state: FSMContext):
+    user_id = callback.from_user.id
+    target_opponent_id = int(callback.data.split(":")[1])
+
+    p1_key = StorageKey(bot_id=bot.id, chat_id=callback.message.chat.id, user_id=user_id)
+    skipper_data = await state.storage.get_data(p1_key)
+
+    # Проверки
+    if not skipper_data: return await callback.answer("Ошибка: Состояние боя не найдено.", show_alert=True)
+    if skipper_data['current_turn'] != user_id: return await callback.answer("Сейчас не ваш ход!", show_alert=True)
+    if skipper_data['opponent_id'] != target_opponent_id: return await callback.answer("Ошибка: Неверная цель.", show_alert=True)
+
+    await callback.answer("Пропускаем ход...")
+
+    opponent_id = target_opponent_id
+    opponent_data = await state.storage.get_data(key=f'fsm:{opponent_id}:{opponent_id}')
+    if not opponent_data: return
+
+    # Передаем ход
+    skipper_data['current_turn'] = opponent_id
+    opponent_data['current_turn'] = opponent_id
+    # Увеличиваем раунд, если нужно (логика как в атаке)
+    if skipper_data['opponent_id'] == opponent_id: # Если p2 ходил (пропускал)
+          opponent_data['round'] += 1
+          skipper_data['round'] = opponent_data['round']
+
+    # Обновляем данные FSM
+    await state.storage.set_data(key=f'fsm:{user_id}:{user_id}', data=skipper_data)
+    await state.storage.set_data(key=f'fsm:{opponent_id}:{opponent_id}', data=opponent_data)
+
+    # Обновляем сообщения для обоих игроков
+    await send_battle_turn_message(user_id, state, bot)
+    await send_battle_turn_message(opponent_id, state, bot)
 
 
 @arena_handler.callback_query(F.data == "arena_team")

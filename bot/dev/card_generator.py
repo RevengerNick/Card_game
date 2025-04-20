@@ -28,13 +28,13 @@ def generate_random_cards(amount):
         rarity = weighted_rarity()
 
         base_attack = random.randint(500, 1500)
-        base_health = random.randint(1000, 2000)
+        base_health = random.randint(2000, 6000)
         multiplier = {
             "common": 1,
-            "rare": 2,
-            "epic": 3,
-            "legendary": 5,
-            "mythical": 10
+            "rare": 3,
+            "epic": 5,
+            "legendary": 8,
+            "mythical": 15
         }.get(rarity, 1)
 
         attack = int(base_attack * multiplier)

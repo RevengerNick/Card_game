@@ -10,9 +10,6 @@ from bot.handlers.arena import arena_handler
 # Хранилище для состояний (в памяти для простоты, лучше Redis для масштабирования)
 fsm_storage = MemoryStorage()
 
-class BattleState(StatesGroup):
-    InBattle = State()
-
 from bot.common import bot
 
 from aiogram import Bot, Dispatcher, F

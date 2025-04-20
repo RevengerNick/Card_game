@@ -30,6 +30,12 @@ DB_PORT = "5432"
 
 DSN = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
+@dataclass
+class DeckProfile:
+    attack: int
+    health: int
+    value: int
+
 # --- Датаклассы и константы ---
 @dataclass
 class UserProfile:
