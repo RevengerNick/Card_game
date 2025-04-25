@@ -13,6 +13,7 @@ from bot.handlers.clans import clan as clan_handler
 from bot.dev.dev import router as router_development
 
 # Хранилище для состояний (в памяти для простоты, лучше Redis для масштабирования)
+
 fsm_storage = MemoryStorage()
 
 from bot.common import bot
