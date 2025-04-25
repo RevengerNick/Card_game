@@ -6,7 +6,7 @@ import os, json
 file_path = os.getenv('python_conf')
 with open(file_path, 'r') as file:
     config = json.load(file)
-TOKEN = config.get("bot_translator")
+TOKEN = config.get("bot_revcard")
 
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode='HTML'))

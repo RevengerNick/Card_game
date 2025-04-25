@@ -81,3 +81,4 @@ class CommandManager:
             )
             return deck
         else: return None
+

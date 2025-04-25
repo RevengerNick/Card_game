@@ -1,12 +1,16 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram import F
+from aiogram import F, Bot # Import Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command, CommandStart, CommandObject
 from aiogram import Router
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+import logging # Import logging
+from typing import Optional, List
 
+from bot.card_database import rarity_translate
 from bot.keyboards.main_keyboard import main_menu
-from bot.Classes.db_manager import task_manager, command_manager
+# Import case_manager
+from bot.Classes.db_manager import task_manager, command_manager, user_manager, clan_manager, card_manager #, case_manager
 
 reward_levels = [
         (10, 5, 0),
@@ -20,7 +24,6 @@ reward_levels = [
 
 BOT_USERNAME = "translateevery_bot"
 
-from bot.Classes.db_manager import card_manager, user_manager, clan_manager, promo_manager
 
 def action_button(text: str, data: str) -> InlineKeyboardButton:
     return InlineKeyboardButton(text=text, callback_data=data)
@@ -35,25 +38,48 @@ def create_back_button(callback_data: str) -> InlineKeyboardMarkup:
         ]
     )
 
-def get_pagination_keyboard(position, current_page: int, total_pages: int, buttons=None) -> InlineKeyboardMarkup:
-    keyboard = []
+def get_pagination_keyboard(
+    position: str,
+    current_page: int,
+    total_pages: int,
+    extra_buttons: Optional[List[List[InlineKeyboardButton]]] = None,
+    back_callback: str = "menu" # Default back button goes to main menu
+    ) -> InlineKeyboardMarkup:
+    """Creates pagination keyboard with optional extra buttons and a back button."""
+    builder = InlineKeyboardBuilder()
+    nav_row = []
 
-    # Верхний ряд — пагинация
-    pagination_buttons = []
+    # Previous Page Button
     if current_page > 1:
-        pagination_buttons.append(InlineKeyboardButton(text="⬅", callback_data=f"{position}:{current_page - 1}"))
+        nav_row.append(InlineKeyboardButton(text="⬅️", callback_data=f"{position}:{current_page - 1}"))
+    else: # Add a placeholder or spacer if you want consistent button width
+         nav_row.append(InlineKeyboardButton(text=" ", callback_data="noop")) # No operation
+
+    # Page Indicator Button
+    nav_row.append(InlineKeyboardButton(text=f"{current_page}/{total_pages}", callback_data="noop"))
+
+    # Next Page Button
     if current_page < total_pages:
-        pagination_buttons.append(InlineKeyboardButton(text="➡", callback_data=f"{position}:{current_page + 1}"))
+        nav_row.append(InlineKeyboardButton(text="➡️", callback_data=f"{position}:{current_page + 1}"))
+    else: # Placeholder/spacer
+         nav_row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
 
-    if pagination_buttons:
-        keyboard.append(pagination_buttons)
+    # Add the navigation row if it contains actual buttons (prevents empty row if total_pages=1)
+    if any(b.callback_data != "noop" for b in nav_row):
+         builder.row(*nav_row)
 
-    # Нижние ряды — пользовательские кнопки по 2 в ряд
-    if buttons:
-        for i in range(0, len(buttons), 2):
-            keyboard.append(buttons[i:i + 2])
+    # Add extra buttons (like item buttons in shop)
+    if extra_buttons:
+        for row in extra_buttons:
+            builder.row(*row)
 
-    return InlineKeyboardMarkup(inline_keyboard=keyboard) if keyboard else None
+    # Add the back button at the bottom
+    builder.row(back_button(back_callback))
+
+    return builder.as_markup()
+
+dp = Router()
+
 
 dp = Router()
 
@@ -248,7 +274,7 @@ async def menu_shop(callback: CallbackQuery):
             "1000 PoTi Coin ➻ 100 руб\n"
             "3000 PoTi Coin ➻ (300) 200 руб\n"
             "10000 PoTi Coin ➻ (1000) 600 руб\n",
-            reply_markup=get_pagination_keyboard(position, current_page, total_pages, buttons=[back_button("menu")])
+            reply_markup=get_pagination_keyboard(position, current_page, total_pages, extra_buttons=[[back_button("menu")]])
         )
     elif current_page == 2:
         await callback.message.edit_text(
@@ -257,19 +283,19 @@ async def menu_shop(callback: CallbackQuery):
         "10 карт ➻ 1449 PoTi Coin\n"
         "30 карт ➻ 3000 PoTi Coin\n"
         "100 карт ➻ 10000 PoTi Coin\n",
-            reply_markup=get_pagination_keyboard(position, current_page, total_pages, buttons=[back_button("menu")])
+            reply_markup=get_pagination_keyboard(position, current_page, total_pages, extra_buttons=[[back_button("menu")]])
         )
     else:
         await callback.message.edit_text(
             f"{callback.from_user.first_name}, здесь ты можешь приобрести за PoTi Coin наши кейсы (эксклюзивные карточки):\n\n"
             "Кейс 1 - $$$\nКейс 2 - $$$\nКейс 3 - $$$",
-            reply_markup=get_pagination_keyboard(position, current_page, total_pages, buttons=[back_button("menu")])
+            reply_markup=get_pagination_keyboard(position, current_page, total_pages, extra_buttons=[[back_button("menu")]])
         )
 
 
 @dp.callback_query(F.data == "craft")
 async def menu_craft(call: CallbackQuery):
-    common_duplicates, rare_duplicates, epic_duplicates, shards = "0000"
+    user_data = await  user_manager.get_user_info(call.from_user.id)
     craft_keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="Скрафтить из ⚡", callback_data="craft_common"),
@@ -286,10 +312,10 @@ async def menu_craft(call: CallbackQuery):
     text = (
         f"<b>{call.from_user.first_name}</b>, ты можешь скрафтить попытки из повторок и осколков\n\n"
         f"<b>🌐 Твои повторки и осколки</b>\n"
-        f"┏⚡ Обычные — {common_duplicates}\n"
-        f"┠✨ Редкие — {rare_duplicates}\n"
-        f"┠🐉 Эпические — {epic_duplicates}\n"
-        f"┗🧱 Осколки — {shards}\n\n"
+        f"┏⚡ Редкие— {user_data.shards_rare}\n"
+        f"┠✨ Эпические — {user_data.shards_epic}\n"
+        f"┠🐉 Легендарные — {user_data.shards_legendary}\n"
+        f"┗🧱 Осколки — {user_data.shards}\n\n"
         f"<b>🍬 Стоимость крафтов</b>\n"
         f"┏10 ⚡ карт ➠ 1 попытка\n"
         f"┠10 ✨ карт ➠ 2 попытки\n"
@@ -300,6 +326,33 @@ async def menu_craft(call: CallbackQuery):
     )
     await call.message.edit_text(text=text, reply_markup=craft_keyboard)
 
+
+@dp.callback_query(F.data == "craft_shard")
+async def craft_shard(call: CallbackQuery):
+    user_id = call.from_user.id
+    if user_manager.spend_shards(user_id, 10):
+        card = card_manager.get_random_card(user_id, exclude_received=False)
+        if card:
+            card_manager.give_card_to_user(user_id, card['id'], card['rarity'])
+        caption = (
+            f"{call.from_user.first_name}, ты получил новую карточку! 🃏\n"
+            f"\n✨ <b>{card['name']}</b>\n"
+            f"⚜️ Редкость: {rarity_translate[card['rarity']]}\n"
+            f"🔪 Атака: {card['attack']}\n"
+            f"❤️ Здоровье: {card['health']}\n"
+            f"\n💠 Ценность: {card['value']} pts"
+        )
+        if card["image_path"]:
+            await call.message.answer_photo(photo=card['image_path'], caption=caption, parse_mode="HTML",
+                                       reply_markup=main_menu())
+            task_manager.update_task_progress(
+                user_id=user_id,
+                event_type='GET_CARD',
+                rarity=card['rarity']  # Передаем редкость полученной карты
+            )
+
+        else:
+            await call.message.answer(caption, parse_mode="HTML", reply_markup=main_menu())
 
 
 @dp.callback_query(F.data == "quests")
@@ -548,3 +601,142 @@ async def process_clan_callback(call):
             await call.answer("Вы успешно вступили в клан!")
         else:
             await call.answer("Не удалось вступить в клан. Возможно, вы уже состоите в клане.")
+
+SHOP_ITEMS_PER_PAGE = 5 # Adjust as needed
+
+@dp.callback_query(F.data.startswith("shop:"))
+async def menu_shop(callback: CallbackQuery):
+    position = callback.data.split(":")[0] # Should be "shop"
+    try:
+        current_page = int(callback.data.split(":")[1])
+    except (IndexError, ValueError):
+        current_page = 1
+
+    all_cases = case_manager.get_all_cases()
+    total_cases = len(all_cases)
+    total_pages = (total_cases + SHOP_ITEMS_PER_PAGE - 1) // SHOP_ITEMS_PER_PAGE
+    if total_pages == 0: total_pages = 1 # At least one page even if empty
+
+    # Clamp page number
+    current_page = max(1, min(current_page, total_pages))
+
+    start_index = (current_page - 1) * SHOP_ITEMS_PER_PAGE
+    end_index = start_index + SHOP_ITEMS_PER_PAGE
+    cases_on_page = all_cases[start_index:end_index]
+
+    text = f"🔮 {callback.from_user.first_name}, добро пожаловать в магазин!\n\n"
+    shop_buttons = []
+
+    if not cases_on_page:
+        text += "ℹ️ Кейсы пока не добавлены в магазин."
+    else:
+        text += "✨ **Доступные кейсы:**\n"
+        for case in cases_on_page:
+            price_str = ""
+            buttons_row = []
+            if case['price_coins'] > 0:
+                 price_str += f"{case['price_coins']} 🪙"
+                 buttons_row.append(InlineKeyboardButton(text=f"Купить за 🪙", callback_data=f"buy_case:coins:{case['id']}"))
+            if case['price_shards'] > 0:
+                 if price_str: price_str += " или "
+                 price_str += f"{case['price_shards']} 🀄️"
+                 buttons_row.append(InlineKeyboardButton(text=f"Купить за 🀄️", callback_data=f"buy_case:shards:{case['id']}"))
+
+            if not price_str: price_str = "Бесплатно" # Or handle cases without price differently
+
+            text += f"\n📦 **{case['name']}** ({case['card_count']} карт)\n"
+            if case['description']:
+                text += f"   📝 {case['description']}\n"
+            text += f"   💰 Цена: {price_str}\n"
+
+            if buttons_row: # Add buy buttons if case is purchasable
+                shop_buttons.append(buttons_row)
+            shop_buttons.append([InlineKeyboardButton(text="-"*20, callback_data="noop")]) # Separator
+
+    # Add fixed items like PoTi Coin purchase (if desired) on every page? Or separate section?
+    # For simplicity, let's keep them separate for now or integrate differently.
+
+    # Add back button to the extra_buttons list
+    extra_nav = [[back_button("menu")]]
+
+    keyboard = get_pagination_keyboard("shop", current_page, total_pages, extra_buttons=shop_buttons + extra_nav)
+
+    try:
+        await callback.message.edit_text(text, reply_markup=keyboard, parse_mode="Markdown")
+    except TelegramBadRequest as e:
+        # Handle potential "message is not modified" error if content is the same
+        if "message is not modified" in str(e):
+            await callback.answer() # Just acknowledge the button tap
+        else:
+            logging.error(f"Error editing shop message: {e}")
+            await callback.answer("Произошла ошибка при обновлении магазина.")
+
+
+@dp.callback_query(F.data.startswith("buy_case:"))
+async def buy_case_handler(callback: CallbackQuery, bot: Bot): # Inject Bot instance
+    user_id = callback.from_user.id
+    parts = callback.data.split(":")
+    if len(parts) != 3:
+        await callback.answer("Ошибка данных покупки.", show_alert=True)
+        return
+
+    currency_type = parts[1] # 'coins' or 'shards'
+    try:
+        case_id = int(parts[2])
+    except ValueError:
+        await callback.answer("Неверный ID кейса.", show_alert=True)
+        return
+
+    # --- Attempt to open the case ---
+    await callback.answer(f"Открываем кейс...") # Indicate processing
+
+    obtained_cards, status_message = case_manager.open_case(user_id, case_id)
+
+    if obtained_cards is None:
+        # Failed to open (insufficient funds, case empty, DB error)
+        await callback.message.answer(f"🚫 Не удалось открыть кейс: {status_message}", reply_markup=create_back_button("shop:1")) # Go back to shop page 1
+        return
+
+    # --- Success! Format and display the obtained cards ---
+    result_text = f"🎉 {status_message}\n\n**Ты получил:**\n"
+    media_group = []
+    text_fallback_lines = [] # For cards without images
+
+    for i, card in enumerate(obtained_cards):
+        rar_emoji = rarity_translate.get(card['rarity'], "<?>")[0:3]
+        card_line = f"{i+1}. {rar_emoji} **{card['name']}** (А:{card['attack']}/З:{card['health']})"
+        result_text += card_line + "\n"
+        text_fallback_lines.append(card_line)
+
+        if card.get('image_path'):
+             media_group.append(InputMediaPhoto(media=card['image_path'], caption=card_line if len(obtained_cards) <= 10 else None)) # Add caption only for few cards
+        else:
+             # Handle cards without images - maybe add to text description?
+             pass # Already added to result_text
+
+    # Send results
+    if media_group:
+        try:
+            # Send as media group if multiple images exist
+            if len(media_group) > 1:
+                 await bot.send_media_group(chat_id=user_id, media=media_group[:10]) # Max 10 per group
+                 # Send the text summary separately if media group was used
+                 await callback.message.answer(f"🎉 {status_message}\n\n**Полный список полученного:**\n" + "\n".join(text_fallback_lines), reply_markup=create_back_button("shop:1"), parse_mode="Markdown")
+            elif len(media_group) == 1:
+                 # Send single photo with full caption
+                 await bot.send_photo(chat_id=user_id, photo=media_group[0].media, caption=result_text, reply_markup=create_back_button("shop:1"), parse_mode="Markdown")
+
+        except Exception as e:
+            logging.error(f"Error sending case results media group/photo for user {user_id}: {e}")
+            # Fallback to text message if media sending failed
+            await callback.message.answer(result_text, reply_markup=create_back_button("shop:1"), parse_mode="Markdown")
+    else:
+        # Send as plain text if no images
+        await callback.message.answer(result_text, reply_markup=create_back_button("shop:1"), parse_mode="Markdown")
+
+
+# No operation callback handler for pagination display button
+@dp.callback_query(F.data == "noop")
+async def noop_callback(callback: CallbackQuery):
+    await callback.answer()
+

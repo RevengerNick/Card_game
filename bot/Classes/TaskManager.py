@@ -1,8 +1,8 @@
-# task_manager.py
-
 import datetime as dt
 import random
 from typing import List, Dict, Any, Optional, TYPE_CHECKING
+
+quest_reward = f"📬🀄️ name, тебе начислено 5 осколков за выполнение ежедневного задания"
 
 from bot.card_database import DatabaseManager
 from bot.Classes.UserManager import UserManager
@@ -233,7 +233,6 @@ class TaskManager:
                 "INSERT INTO daily_bonus_claimed (user_id, date) VALUES (%s, %s) ON CONFLICT DO NOTHING",
                 (user_id, date)
             )
-            print(f"Пользователь {user_id} выполнил ВСЕ задания за {date}, получил бонус {self.BONUS_REWARD_SHARDS} осколков!")
 
     def format_tasks_message(self, user_id: int, username: str) -> str:
         """Форматирует сообщение с заданиями для пользователя."""
@@ -277,3 +276,4 @@ class TaskManager:
          now_utc = dt.datetime.now(dt.timezone.utc)
          midnight_utc = (now_utc + dt.timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
          return midnight_utc - now_utc
+

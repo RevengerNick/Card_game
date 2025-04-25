@@ -46,6 +46,18 @@ async def reset_last_time(message: Message):
     card_manager.reset_last_received_time(message.from_user.id)
     await message.answer("time reset")
 
+@router.message(F.text.startswith("/get_cards"))
+async def reset_last_time(message: Message):
+    if int(message.text[10:])> 100:
+        await message.answer(f"Да вы ахуели сударь")
+        return
+    for i in range(0, int(message.text[10:])):
+        card = card_manager.get_random_card(user_id=message.from_user.id, exclude_received=True)
+        if card:
+            card_manager.give_card_to_user(message.from_user.id, card['id'], card["rarity"])
+
+    await message.answer(f"Отдал кровные {message.text[10:]} карт")
+
 
 @router.message(Command("add"))
 async def handle_add_poti_coins(message: Message):

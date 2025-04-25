@@ -7,7 +7,6 @@ from psycopg2.tz import FixedOffsetTimezone
 from bot.card_database import DatabaseManager, RARITY_WEIGHTS, reward_levels, db
 from bot.Classes.UserManager import UserManager
 import random
-
 import psycopg2
 import psycopg2.extras # для DictCursor
 
@@ -114,7 +113,7 @@ class CardManager:
         reset_time = reset_time.replace(tzinfo=FixedOffsetTimezone(offset=0))
         self.user_manager.update_last_card_time(user_id, reset_time)
 
-    def give_card_to_user(self, user_id: int, card_id: int, amount: int = 1) -> Dict[str, Any]:
+    def give_card_to_user(self, user_id: int, card_id: int, rarity: str, amount: int = 1) -> Dict[str, Any]:
         """
         Выдает карту пользователю, обновляет счетчики и проверяет/выдает награды за этапы.
         Возвращает словарь с результатом и списком выданных наград.
@@ -169,17 +168,19 @@ class CardManager:
                 # --- Логика проверки и выдачи наград ---
                 rewards_granted_list = []
                 total_coins_reward = 0
+                total_shards_reward = 0
                 reward_cards_to_add = [] # Список ID карт для награды
 
-                for goal, card_reward_count, coins_reward in reward_levels:
+                for goal, coins_reward, shards in reward_levels:
                     # Проверяем, был ли порог ПЕРЕСЕЧЕН именно в этом вызове
                     if old_total_received < goal <= new_total_received:
                         print(f"Пользователь {user_id} достиг рубежа {goal} карт!") # Лог
-
-                #         # Начисляем монеты
-                #         if coins_reward > 0:
-                #             total_coins_reward += coins_reward
-                #             rewards_granted_list.append({'type': 'coins', 'amount': coins_reward, 'goal': goal})
+                        if coins_reward > 0:
+                             total_coins_reward += coins_reward
+                             rewards_granted_list.append({'type': 'coins', 'amount': coins_reward, 'goal': goal})
+                        if coins_reward > 0:
+                            total_shards_reward += shards
+                            rewards_granted_list.append({'type': 'shards', 'amount': shards, 'goal': goal})
                 #
                 #         # Генерируем ID карт для награды
                 #         if card_reward_count > 0:
@@ -199,8 +200,18 @@ class CardManager:
                 # # 3. Применяем награды (если есть) в той же транзакции
                 #
                 # # Обновляем монеты (если есть награда)
-                # if total_coins_reward > 0:
-                #     cur.execute("UPDATE users SET coins = coins + %s WHERE user_id = %s", (total_coins_reward, user_id))
+                if total_coins_reward > 0:
+                    print(f"give money{total_shards_reward}")
+                    #self.user_manager.add_coins(user_id, tot)
+                    print(self.user_manager.get_coins(user_id))
+                    self.user_manager.add_coins(user_id, total_coins_reward)
+                    print(self.user_manager.get_coins(user_id))
+                    #cur.execute("UPDATE users SET coins = coins + %s WHERE user_id = %s", (total_coins_reward, user_id))
+
+                if total_shards_reward > 0:
+                    print("give shards")
+                    self.user_manager.add_shards(user_id, total_shards_reward)
+                    #cur.execute("UPDATE users SET coins = coins + %s WHERE user_id = %s", (total_coins_reward, user_id))
                 #
                 # # Выдаем наградные карты
                 # if reward_cards_to_add:
