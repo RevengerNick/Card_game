@@ -1,179 +1,205 @@
+# bot\main.py
 import asyncio
 import logging
 import sys
+from typing import Union
 
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage # Или RedisStorage для продакшена
-
-# Import routers
-from bot.handlers.arena import arena_handler
-from bot.handlers.mainMenu import dp as router_main_menu, create_back_button, back_button
-from bot.handlers.clans import clan as clan_handler
-#from bot.handlers.admin_handlers import admin_router # <<< NEW: Import admin router
-from bot.dev.dev import router as router_development
-
-# Хранилище для состояний (в памяти для простоты, лучше Redis для масштабирования)
-
+from aiogram.filters import Filter
+# Настройка FSM Storage (MemoryStorage для разработки)
+from aiogram.fsm.storage.memory import MemoryStorage
 fsm_storage = MemoryStorage()
+# Для Redis:
+# from aiogram.fsm.storage.redis import RedisStorage
+# from redis.asyncio import Redis
+# redis_client = Redis(host='localhost', port=6379, db=0) # Настройте подключение
+# fsm_storage = RedisStorage(redis=redis_client)
 
-from bot.common import bot
+# Импорт роутеров в нужном порядке
+from bot.handlers.admin_handlers import admin_router
+from bot.dev.dev import router as router_development
+from bot.handlers.mainMenu import dp as router_main_menu, create_back_button, back_button # mainMenu содержит dp? Переименовать dp в router?
+from bot.handlers.arena import arena_handler
+from bot.handlers.clans import clan as clan_handler
 
-from aiogram import Bot, Dispatcher, F, BaseMiddleware
-from aiogram.types import Update # Import Update type
+# Импорт common.py для экземпляра бота
+from bot.common import bot # bot может быть None, если токен не найден
 
-from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
-)
+# Базовые импорты aiogram
+from aiogram import Dispatcher, F, BaseMiddleware
+from aiogram.types import Update, Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, User # Добавил User
+from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 from datetime import datetime, timedelta, timezone
 
-# Import managers and db instance AFTER database setup
-from bot.Classes.db_manager import card_manager, user_manager, task_manager, db, command_manager, clan_manager, promo_manager
-from bot.card_database import rarity_translate, DatabaseManager # Keep DatabaseManager if needed elsewhere
+# Импорт менеджеров и экземпляра БД
+# Убедитесь, что db_manager.py успешно инициализирует ВСЕ менеджеры
+from bot.Classes.db_manager import (
+    card_manager, user_manager, task_manager, command_manager,
+    clan_manager, promo_manager, case_manager, db # case_manager импортирован
+)
 
+# Импорт констант и хелперов
+from bot.card_database import rarity_translate
 from bot.keyboards.main_keyboard import main_menu
 
-# --- Ban Check Middleware (Optional but recommended) ---
+# --- Ban Check Middleware ---
 class BanCheckMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        # Works for both Message and CallbackQuery
         user = event.from_user
         if user:
-            # Check if user exists and is banned using the raw method
-            # Avoid get_user_info here as it might return None for banned users already
-            user_data = user_manager.get_user_raw(user.id)
-            if user_data and user_data.get('is_banned'):
-                logging.info(f"User {user.id} is banned. Blocking event.")
-                # Optionally send a message to the banned user
-                # try:
-                #     if isinstance(event, Message):
-                #         await event.answer("🚫 Ваш аккаунт заблокирован.")
-                #     elif isinstance(event, CallbackQuery):
-                #         await event.answer("🚫 Ваш аккаунт заблокирован.", show_alert=True)
-                # except Exception: pass # Ignore errors sending to banned users
-                return # Stop processing the event
+            try:
+                # Используем синхронный метод get_user_raw
+                user_data = user_manager.get_user_raw(user.id)
+                if user_data and user_data.get('is_banned'):
+                    logging.info(f"User {user.id} is banned. Blocking event type: {type(event).__name__}")
+                    if isinstance(event, CallbackQuery):
+                         try:
+                             await event.answer("🚫 Ваш аккаунт заблокирован.", show_alert=True)
+                         except Exception: pass # Игнорируем ошибки отправки забаненному
+                    # Не отвечаем на сообщения от забаненных, чтобы не спамить
+                    return # Останавливаем обработку
+            except Exception as e:
+                logging.error(f"Ошибка во время проверки бана для user {user.id}: {e}")
+                # Решаем, блокировать ли событие при ошибке проверки? Безопаснее блокировать.
+                # return # Раскомментировать для блокировки при ошибке
         return await handler(event, data)
 
-
 # --- Dispatcher Setup ---
+# Проверяем, что bot не None перед созданием Dispatcher
+if bot is None:
+    logging.critical("Экземпляр бота не создан (отсутствует токен?). Запуск невозможен.")
+    exit(1)
+# Проверяем, что менеджеры инициализированы
+if user_manager is None: # Достаточно проверить один менеджер
+     logging.critical("Менеджеры не были инициализированы (ошибка в db_manager?). Запуск невозможен.")
+     exit(1)
+
 dp = Dispatcher(storage=fsm_storage)
 
 # --- Register Middlewares ---
 dp.message.outer_middleware(BanCheckMiddleware())
 dp.callback_query.outer_middleware(BanCheckMiddleware())
 
-# --- Register Routers (Admin router should be checked early if needed) ---
-#dp.include_router(admin_router)      # <<< NEW: Added admin router
+# --- Register Routers ---
+# Порядок важен: специфичные (admin, dev) -> общие фичи -> главное меню
+dp.include_router(admin_router)
+dp.include_router(router_development)
 dp.include_router(arena_handler)
-dp.include_router(router_development) # Dev router - keep it if needed for testing
-dp.include_router(router_main_menu)
 dp.include_router(clan_handler)
-# Add other routers if you have them
+# Обработчики из mainMenu (переименовать бы dp там в router)
+dp.include_router(router_main_menu) # Этот роутер должен идти после более специфичных
 
-
-# --- Existing Handlers (Example: get_card) ---
+# --- Existing Handlers (Example: get_card - ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ИЗ ПРЕДЫДУЩЕГО ОТВЕТА НЕ ИЗМЕНИЛИСЬ) ---
+# Оставил только get_card как пример, остальные (my_cards, show_settings и т.д.) остаются такими же,
+# как в предыдущем ответе, так как они не требовали изменений.
 
 @dp.message(F.text == "🃏 Получить карточку")
 async def get_card(message: Message):
-    # Ban check is handled by middleware now
-    user_manager.register_user(message.from_user.id, message.from_user.username) # Ensure user exists
+    # Ban check is handled by middleware
     user_id = message.from_user.id
+    username = message.from_user.username or f"User_{user_id}" # Use username or generate one
 
-    if card_manager.can_receive_card(user_id):
-        card = card_manager.get_random_card(user_id=user_id, exclude_received=False) # Pass user_id if needed
+    # Ensure user is registered (idempotent operation)
+    user_manager.register_user(user_id, username)
+
+    # Check cooldown (consider Battle Pass reduction)
+    user_info = await user_manager.get_user_info(user_id) # Use sync version
+    if not user_info: # Should not happen if register_user worked, but handles edge cases
+        logging.warning(f"User {user_id} not found after registration attempt in get_card.")
+        await message.answer("Произошла ошибка. Попробуйте /start и затем снова.", reply_markup=main_menu())
+        return
+
+    cooldown_hours = 3 if user_info.has_battle_pass else 4
+    can_receive, time_remaining = card_manager.can_receive_card(user_id, cooldown_hours=cooldown_hours)
+
+    if can_receive:
+        card = card_manager.get_random_card(user_id=user_id, exclude_received=False) # Consider exclude_received logic carefully
         if card:
-            # Give card returns a dict now, check for rewards
-            result = card_manager.give_card_to_user(user_id, card['id'], card["rarity"]) # Pass rarity
+            # Give card returns a dict now, including rewards
+            result = card_manager.give_card_to_user(user_id, card['id'], card["rarity"], source='spin') # Pass rarity and source
 
-            caption = (
-                f"{message.from_user.first_name}, ты получил новую карточку! 🃏\n"
-                f"\n✨ <b>{card['name']}</b>\n"
-                f"⚜️ Редкость: {rarity_translate.get(card['rarity'], card['rarity'])}\n" # Use .get for safety
-                f"🔪 Атака: {card['attack']}\n"
-                f"❤️ Здоровье: {card['health']}\n"
-                f"\n💠 Ценность: {card['value']} pts"
-            )
-            photo = card.get('image_path') # Use .get for safety
-
-            # Notify about rewards if any
-            reward_text = ""
-            if result.get('success') and result.get('rewards'):
-                 reward_lines = []
-                 for reward in result['rewards']:
-                     if reward['type'] == 'coins':
-                         reward_lines.append(f"💰 +{reward['amount']} монет за {reward['goal']} карт!")
-                     elif reward['type'] == 'shards':
-                          reward_lines.append(f"🀄️ +{reward['amount']} осколков за {reward['goal']} карт!")
-                     # Add other reward types if implemented
-                 if reward_lines:
-                     reward_text = "\n\n🎁 **Бонусы за сбор:**\n" + "\n".join(reward_lines)
-                 caption += reward_text # Append rewards to caption
-
-            if photo:
-                try:
-                    await message.answer_photo(photo=photo, caption=caption, parse_mode="HTML", reply_markup=main_menu())
-                except TelegramBadRequest as e:
-                    logging.error(f"Error sending photo for card {card['id']} ({photo}): {e}")
-                    await message.answer(caption, parse_mode="HTML", reply_markup=main_menu()) # Fallback to text
-            else:
-                await message.answer(caption, parse_mode="HTML", reply_markup=main_menu())
-
-            # Update task progress (AFTER successful card grant)
             if result.get('success'):
+                caption = (
+                    f"{message.from_user.first_name}, ты получил новую карточку! 🃏\n"
+                    f"\n✨ <b>{card['name']}</b>\n"
+                    f"⚜️ Редкость: {rarity_translate.get(card['rarity'], card['rarity'].capitalize())}\n"
+                    f"🔪 Атака: {card['attack']}\n"
+                    f"❤️ Здоровье: {card['health']}\n"
+                    f"\n💠 Ценность: {card['value']} pts"
+                )
+                photo_file_id = card.get('image_path')
+
+                # Notify about rewards if any
+                reward_text = ""
+                if result.get('rewards'):
+                     reward_lines = []
+                     for reward in result['rewards']:
+                         if reward['type'] == 'coins':
+                             reward_lines.append(f"💰 +{reward['amount']} монет за {reward['goal']} карт!")
+                         elif reward['type'] == 'shards':
+                              reward_lines.append(f"🀄️ +{reward['amount']} осколков за {reward['goal']} карт!")
+                         # Add other reward types if implemented (e.g., 'card')
+                     if reward_lines:
+                         # Используем HTML для жирного шрифта
+                         reward_text = "\n\n🎁 <b>Бонусы за сбор:</b>\n" + "\n".join(reward_lines)
+                     caption += reward_text # Append rewards to caption
+
+                send_func = message.answer_photo if photo_file_id else message.answer
+                kwargs = {"caption": caption, "parse_mode": "HTML", "reply_markup": main_menu()}
+                if photo_file_id:
+                    kwargs["photo"] = photo_file_id
+
+                try:
+                    await send_func(**kwargs)
+                except TelegramBadRequest as e:
+                    logging.error(f"Error sending photo for card {card['id']} ({photo_file_id}): {e}. Falling back to text.")
+                    # Fallback to text if photo sending fails (e.g., invalid file_id)
+                    await message.answer(caption, parse_mode="HTML", reply_markup=main_menu())
+                except Exception as e:
+                     logging.error(f"Unexpected error sending card message: {e}")
+                     await message.answer("Произошла ошибка при отправке карты.", reply_markup=main_menu())
+
+
+                # Update task progress (AFTER successful card grant)
                 task_manager.update_task_progress(
                     user_id=user_id,
                     event_type='GET_CARD',
                     rarity=card['rarity']
                 )
+            else:
+                # Handle failure from give_card_to_user (e.g., DB error)
+                 logging.error(f"Failed to give card {card['id']} to user {user_id}: {result.get('message')}")
+                 await message.answer("⏳ Не удалось выдать карту из-за внутренней ошибки. Попробуй позже.", reply_markup=main_menu())
+
         else:
-            # Check if it's because user has all cards or DB error
-            all_cards_in_game = db.execute("SELECT COUNT(*) as count FROM cards", fetch='one')['count']
-            user_unique_cards = db.execute("SELECT COUNT(DISTINCT card_id) as count FROM user_cards WHERE user_id = %s", (user_id,), fetch='one')['count']
-            if user_unique_cards >= all_cards_in_game:
+            # Check if it's because user has all cards or DB error/no cards exist
+            all_cards_in_game_row = db.execute("SELECT COUNT(*) as count FROM cards", fetch='one')
+            user_unique_cards_row = db.execute("SELECT COUNT(DISTINCT card_id) as count FROM user_cards WHERE user_id = %s", (user_id,), fetch='one')
+            all_cards_in_game = all_cards_in_game_row['count'] if all_cards_in_game_row else 0
+            user_unique_cards = user_unique_cards_row['count'] if user_unique_cards_row else 0
+
+
+            if user_unique_cards >= all_cards_in_game and all_cards_in_game > 0 :
                  await message.answer("🎉 Поздравляем! Ты собрал все доступные карточки в игре!", reply_markup=main_menu())
             else:
+                 logging.warning(f"get_random_card returned None for user {user_id}. No cards available or DB error?")
                  await message.answer("⏳ Не удалось получить карту. Возможно, нет доступных карт или произошла ошибка. Попробуй позже.", reply_markup=main_menu())
 
     else:
-        # Cooldown logic remains the same
-        last_time = user_manager.get_last_card_time(user_id)
-        # Ensure last_time is timezone-aware if comparing with aware datetime.now()
-        if last_time and last_time.tzinfo is None:
-             # Assuming DB stores UTC but without TZ info (adjust if needed)
-             last_time = last_time.replace(tzinfo=timezone.utc)
+        # Cooldown logic
+        remaining_str = str(time_remaining).split(".")[0] # HH:MM:SS format
+        cooldown_hours_str = int(cooldown_hours)
 
-        now_aware = datetime.now(timezone.utc)
-        cooldown = timedelta(hours=4) # Define cooldown duration
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+             [InlineKeyboardButton(text="Купить 1 прокрут за 1 🪙", callback_data="buy_spin")]
+        ])
 
-        # Check if user has battle pass for reduced cooldown
-        user_info = await user_manager.get_user_info(user_id) # Might be None if banned
-        if user_info and user_info.has_battle_pass:
-            cooldown = timedelta(hours=3)
-
-        if last_time:
-            remaining = cooldown - (now_aware - last_time)
-            if remaining.total_seconds() > 0:
-                 remaining_str = str(remaining).split(".")[0] # HH:MM:SS format
-
-                 keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                     [InlineKeyboardButton(text="Купить 1 прокрут за 1 PoTi Coin", callback_data="buy_spin")] # Price corrected
-                 ])
-
-                 await message.answer(
-                     f"🃏🙅‍♂ {message.from_user.first_name}, получать карточки можно раз в {cooldown.total_seconds() // 3600} часа. Приходи через:\n"
-                     "➖➖➖➖➖➖\n"
-                     f"   ⏳ {remaining_str}",
-                     reply_markup=keyboard
-                 )
-            else:
-                 # Should not happen if can_receive_card is False, but as a fallback:
-                 await get_card(message) # Try again immediately if timer calculation was off
-
-        else:
-             # Should not happen if can_receive_card is False, but as a fallback:
-             await get_card(message) # User never received a card
-
-
+        await message.answer(
+            f"🃏🙅‍♂ {message.from_user.first_name}, получать карточки можно раз в {cooldown_hours_str} час{'а' if 2 <= cooldown_hours_str <= 4 else 'ов'}. "
+            f"Приходи через:\n"
+            "➖➖➖➖➖➖\n"
+            f"   ⏳ {remaining_str}",
+            reply_markup=keyboard
+        )
 @dp.message(F.text == "💼 Мои карты")
 async def my_cards(message: Message):
     user_id = message.from_user.id
@@ -208,7 +234,7 @@ async def show_settings(message: Message):
 
     text = (
         f"🪪 *Твой ник:* {nickname}\n"
-        "🆔 *Твой айди:* 254119336\n"
+        f"🆔 *Твой айди:* {user_id}\n"
         f"🥡 *Количество круток:* {total_cards_received}\n"
         #"🗓 *Регистрация:* 13.04.2025 в 16:29\n\n"
         "📝 *Помощь*\n"
@@ -373,25 +399,47 @@ async def buy_spin(call: CallbackQuery):
             )
         )
 
-
-
-
 # --- Main Execution ---
 async def main() -> None:
-    logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    # Add any bot startup logic here (e.g., setting commands)
-    logging.info("Bot starting polling...")
-    # Ensure DB connection is likely alive before starting polling
-    try:
-        db._get_connection().cursor().execute("SELECT 1")
-    except Exception as e:
-        logging.critical(f"Database connection failed on startup: {e}")
-        return # Don't start polling if DB is down
+    # Setup logging
+    log_format = '%(asctime)s - %(levelname)s - [%(name)s] - %(message)s'
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format=log_format)
+    # Настройте уровень логирования для aiogram и других библиотек по необходимости
+    logging.getLogger('aiogram.event').setLevel(logging.INFO) # Менее подробное логирование событий aiogram
+    logging.getLogger('aiogram. FSM').setLevel(logging.INFO) # Логирование FSM
 
-    await dp.start_polling(bot)
-    logging.info("Bot polling stopped.")
+    # Проверка соединения с БД перед запуском
+    try:
+        conn = db._get_connection()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        logging.info("Проверка соединения с базой данных прошла успешно.")
+    except Exception as e:
+        logging.critical(f"Критическая ошибка: Не удалось подключиться к базе данных перед запуском бота: {e}")
+        print(f"КРИТИЧЕСКАЯ ОШИБКА: Не удалось подключиться к БД: {e}. Проверьте настройки и доступность сервера PostgreSQL.", file=sys.stderr)
+        return # Останавливаем выполнение
+
+    logging.info("Запуск бота...")
+    # Запуск polling
+    try:
+        # allowed_updates чтобы получать только нужные типы обновлений
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    except Exception as e:
+        logging.critical(f"Критическая ошибка во время работы бота: {e}", exc_info=True)
+    finally:
+        logging.info("Остановка бота...")
+        # Закрываем соединение с БД
+        db.close()
+        # Закрываем сессию бота
+        await bot.session.close()
+        logging.info("Бот остановлен.")
+
 
 if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logging.info("Бот остановлен вручную (KeyboardInterrupt).")
+    except Exception as main_e:
+        logging.critical(f"Непредвиденная ошибка на верхнем уровне: {main_e}", exc_info=True)
 
-    # Ensure super admin exists on startup (moved this logic to card_database.py __main__)
-    asyncio.run(main())

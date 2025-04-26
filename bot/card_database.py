@@ -13,7 +13,7 @@ DB_USER = "postgres"
 DB_PASSWORD = ""
 DB_HOST = "localhost"
 DB_PORT = "5432"
-SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID", "0"))
+SUPER_ADMIN_ID = [int(os.getenv("SUPER_ADMIN_ID", "254119336"))]
 
 DSN = f"postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
@@ -47,13 +47,13 @@ class UserProfile:
     clan_role: Optional[str] = None
 
 reward_levels = [
-        (10, 5, 0),
-        (50, 10, 0),
-        (100, 15, 0),
-        (350, 20, 50),
-        (500, 50, 300),
-        (1000, 100, 1000),
-        (5000, 300, 5000),
+        (10, 500, 0),
+        (50, 1000, 0),
+        (100, 1500, 0),
+        (350, 2000, 20),
+        (500, 5000, 50),
+        (1000, 10000, 70),
+        (5000, 30000, 100),
     ]
 
 
@@ -73,7 +73,7 @@ RARITY_WEIGHTS = {
     'mythical': 5
 }
 
-# ... (UserProfile, DeckProfile, rarity_translate, RARITY_CHOICES, RARITY_WEIGHTS) ...
+RARITY_CHOICES = ["common", 'rare', 'epic', 'legendary', 'mythical']
 
 # --- Базовый класс для управления БД ---
 class DatabaseManager:
@@ -138,47 +138,49 @@ class DatabaseManager:
         :param query: SQL-запрос с плейсхолдерами %s.
         :param params: Кортеж параметров для запроса.
         :param fetch: 'one', 'all' или None.
-        :return: Результат запроса или None.
+        :return: Результат запроса (DictRow, List[DictRow]), количество затронутых строк (int) для INSERT/UPDATE/DELETE, или None при ошибке.
         """
         conn = self._get_connection()
+        result = None
         try:
             with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
                 cur.execute(query, params)
                 if fetch == 'one':
                     result = cur.fetchone()
+                    # Конвертируем DictRow в обычный dict, если это нужно для консистентности
+                    # return dict(result) if result else None
                 elif fetch == 'all':
                     result = cur.fetchall()
-                else:
-                    result = None # Для INSERT, UPDATE, DELETE
-                conn.commit() # Коммитим изменения после успешного выполнения
-                return result
+                    # return [dict(row) for row in result] if result else []
+                else:  # For INSERT, UPDATE, DELETE
+                    # ----- ИСПРАВЛЕНО ЗДЕСЬ -----
+                    # В случае успешного выполнения не-SELECT запроса,
+                    # возвращаем количество затронутых строк.
+                    result = cur.rowcount
+                    # ---------------------------
+
+                conn.commit()
+                # logging.debug(f"Executed query: {cur.query.decode() if cur.query else query}") # Можно раскомментировать для отладки
         except psycopg2.Error as e:
-            conn.rollback() # Откатываем транзакцию в случае ошибки
-            print(f"Ошибка выполнения запроса: {e}")
-            print(f"Запрос: {query}")
-            print(f"Параметры: {params}")
-            # Можно перевыбросить ошибку или вернуть маркер ошибки
-            # raise e
-            return None # Или специфический маркер ошибки
+            conn.rollback()
+            logging.error(f"Ошибка выполнения запроса: {e}")
+            logging.error(f"Запрос: {query}")
+            logging.error(f"Параметры: {params}")
+            result = None  # Возвращаем None только при ошибке базы данных
+
+        return result  # Возвращаем результат (выборку, количество строк или None при ошибке)
 
     def executescript(self, script: str):
-         """Выполняет несколько SQL-запросов."""
-         conn = self._get_connection()
-         try:
-             with conn.cursor() as cur:
-                 cur.execute(script)
-             conn.commit()
-         except psycopg2.Error as e:
-             conn.rollback()
-             print(f"Ошибка выполнения скрипта: {e}")
-             # raise e
-
-    def close(self):
-        """Закрывает соединение с БД."""
-        if self._conn and self._conn.closed == 0:
-            self._conn.close()
-            print("Соединение с PostgreSQL закрыто")
-
+        """Выполняет несколько SQL-запросов в одной транзакции."""
+        conn = self._get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(script)
+            conn.commit()
+            logging.info("SQL скрипт успешно выполнен.")
+        except psycopg2.Error as e:
+            conn.rollback()
+            logging.error(f"Ошибка выполнения SQL скрипта: {e}")
     # В классе DatabaseManager
 
     # IMPORTANT: Keep the create_tables method with the added case tables from the previous step
@@ -336,7 +338,29 @@ class DatabaseManager:
             drop_weight INTEGER NOT NULL DEFAULT 1 CHECK (drop_weight > 0),
             PRIMARY KEY (case_id, card_id)
         );
+        
+        -- === Таблицы для Мирового Босса ===
+        CREATE TABLE IF NOT EXISTS world_bosses (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            max_health BIGINT NOT NULL CHECK (max_health > 0),
+            current_health BIGINT NOT NULL DEFAULT 0,
+            image_path TEXT, -- Опционально: File ID изображения босса
+            start_time TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            end_time TIMESTAMP WITH TIME ZONE, -- Время победы над боссом
+            is_active BOOLEAN NOT NULL DEFAULT FALSE, -- Только один босс может быть активен
+            rewards_distributed BOOLEAN NOT NULL DEFAULT FALSE -- Флаг, что награды выданы
+        );
 
+        CREATE TABLE IF NOT EXISTS world_boss_damage (
+            id SERIAL PRIMARY KEY,
+            boss_instance_id INTEGER NOT NULL REFERENCES world_bosses(id) ON DELETE CASCADE, -- Связь с конкретным боссом
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, -- Связь с пользователем
+            damage_dealt BIGINT NOT NULL DEFAULT 0 CHECK (damage_dealt >= 0),
+            last_attack_time TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+            UNIQUE (boss_instance_id, user_id) -- Уникальная запись урона для юзера на босса
+        );
+        
         -- === Индексы ===
         -- ... (Existing indexes) ...
         CREATE INDEX IF NOT EXISTS idx_user_decks_user_id ON user_decks(user_id);
@@ -351,6 +375,9 @@ class DatabaseManager:
         CREATE INDEX IF NOT EXISTS idx_case_cards_case_id ON case_cards(case_id);
         CREATE INDEX IF NOT EXISTS idx_case_cards_card_id ON case_cards(card_id);
         CREATE INDEX IF NOT EXISTS idx_card_cases_name ON card_cases(name); -- Index for case lookup by name
+        CREATE INDEX IF NOT EXISTS idx_world_bosses_is_active ON world_bosses(is_active) WHERE is_active = TRUE; -- Быстрый поиск активного босса
+        CREATE INDEX IF NOT EXISTS idx_world_boss_damage_boss_user ON world_boss_damage(boss_instance_id, user_id); -- Поиск урона юзера
+        CREATE INDEX IF NOT EXISTS idx_world_boss_damage_boss_damage ON world_boss_damage(boss_instance_id, damage_dealt DESC); -- Для топа урона
         """
         self.executescript(script)
         logging.info("Создание/обновление таблиц (включая кейсы) выполнено.") # Use logging

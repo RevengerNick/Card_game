@@ -9,4 +9,5 @@ with open(file_path, 'r') as file:
 TOKEN = config.get("bot_revcard")
 
 
+
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode='HTML'))

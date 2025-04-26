@@ -1,61 +1,129 @@
-from typing import Optional, Tuple, Any, List, Dict
-from redis.asyncio import Redis
-import json
-from datetime import timedelta, datetime
-
-redis = Redis(host="localhost", port=6379, decode_responses=True)
-
-from bot.card_database import DatabaseManager, UserProfile, db
+# bot\Classes\UserManager.py
+from typing import Optional, Tuple, Any, List, Dict, Union # Добавил Union
+from datetime import datetime, timezone, timedelta
+import logging
 import psycopg2
 import psycopg2.extras # для DictCursor
+from psycopg2.extensions import cursor as Psycopg2Cursor # For type hinting
+
+# Redis закомментирован, так как не используется активно
+# from redis.asyncio import Redis
+# redis = Redis(host="localhost", port=6379, decode_responses=True)
+
+# Импорт из card_database
+from bot.card_database import DatabaseManager, UserProfile, db, \
+    SUPER_ADMIN_ID  # db здесь не нужен, если db_manager передается
 
 class UserManager:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
 
     def register_user(self, user_id: int, username: Optional[str] = None) -> bool:
-        """Регистрирует нового пользователя или обновляет его username."""
+        """Регистрирует нового пользователя или обновляет его username. Возвращает True при успехе."""
+        username = username if username else None
         query = """
-            INSERT INTO users (user_id, username) VALUES (%s, %s)
-            ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username;
+            INSERT INTO users (user_id, username, registered_at) VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                username = EXCLUDED.username
+            RETURNING user_id; -- Возвращаем ID для подтверждения
         """
-        # Execute returns rowcount for INSERT/UPDATE
-        result = self.db.execute(query, (user_id, username))
-        return result is not None # True if execution didn't fail
+        now_utc = datetime.now(timezone.utc)
+        try:
+            result = self.db.execute(query, (user_id, username, now_utc), fetch='one')
+            return result is not None # Если вернулся результат (ID), значит успешно
+        except psycopg2.Error as e:
+             logging.error(f"Ошибка psycopg2 при регистрации/обновлении пользователя {user_id}: {e}")
+             return False
+        except Exception as e:
+             logging.error(f"Неожиданная ошибка при регистрации/обновлении пользователя {user_id}: {e}")
+             return False
 
     def is_admin(self, user_id: int) -> bool:
         """Проверяет, является ли пользователь администратором."""
         query = "SELECT 1 FROM admins WHERE user_id = %s"
         result = self.db.execute(query, (user_id,), fetch='one')
-        return result is not None
+        if user_id in SUPER_ADMIN_ID:
+            return True
+        else:
+            return result is not None
+
+    def add_free_spins(self, user_id: int, amount: int, cursor: Optional[Psycopg2Cursor] = None) -> bool:
+        """Добавляет бесплатные прокрутки пользователю. Возвращает True при успехе."""
+        if amount <= 0: return False
+        query = "UPDATE users SET free_spins = free_spins + %s WHERE user_id = %s"
+        try:
+            if cursor:
+                cursor.execute(query, (amount, user_id))
+                # Проверяем, что строка была обновлена (пользователь существует)
+                return cursor.rowcount == 1
+            else:
+                rows_affected = self.db.execute(query, (amount, user_id))
+                # rows_affected будет 1 при успехе, 0 если user_id не найден, None при ошибке БД
+                return rows_affected == 1
+        except Exception as e:
+            logging.error(f"Ошибка при добавлении {amount} бесплатных спинов пользователю {user_id}: {e}")
+            return False
 
     def add_admin(self, user_id: int) -> bool:
-        """Добавляет пользователя в администраторы."""
-        # Ensure user exists first
+        """Добавляет пользователя в администраторы. Возвращает True при успехе или если уже был админом."""
         if not self.get_user_raw(user_id):
-             print(f"Cannot add admin: User {user_id} not found in users table.")
+             logging.error(f"Нельзя добавить админа: пользователь {user_id} не найден в таблице users.")
              return False
-        query = "INSERT INTO admins (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING"
-        result = self.db.execute(query, (user_id,))
-        return result == 1 # Returns 1 if inserted, 0 if conflict
+
+        query = "INSERT INTO admins (user_id, added_at) VALUES (%s, %s) ON CONFLICT (user_id) DO NOTHING"
+        now_utc = datetime.now(timezone.utc)
+        try:
+             rows_affected = self.db.execute(query, (user_id, now_utc))
+             # rows_affected будет 1 если вставили, 0 если конфликт (уже админ), None при ошибке
+             if rows_affected is not None: # Успешное выполнение запроса (0 или 1)
+                 if rows_affected == 1:
+                     logging.info(f"Пользователь {user_id} успешно добавлен в администраторы.")
+                 else:
+                     logging.info(f"Пользователь {user_id} уже был администратором.")
+                 return True
+             else: # Ошибка БД
+                 logging.error(f"Не удалось добавить администратора {user_id} (execute вернул None).")
+                 return False
+        except psycopg2.Error as e: # Этот блок может быть избыточен, т.к. execute ловит ошибки
+             logging.error(f"Ошибка psycopg2 при добавлении администратора {user_id}: {e}")
+             return False
+        except Exception as e:
+             logging.error(f"Неожиданная ошибка при добавлении администратора {user_id}: {e}")
+             return False
 
     def remove_admin(self, user_id: int) -> bool:
-        """Удаляет пользователя из администраторов."""
+        """Удаляет пользователя из администраторов. Возвращает True, если строка была удалена."""
         query = "DELETE FROM admins WHERE user_id = %s"
-        result = self.db.execute(query, (user_id,))
-        return result == 1 # Returns 1 if deleted, 0 if not found
+        try:
+             rows_affected = self.db.execute(query, (user_id,))
+             if rows_affected == 1:
+                 logging.info(f"Пользователь {user_id} успешно удален из администраторов.")
+                 return True
+             elif rows_affected == 0:
+                 logging.warning(f"Пользователь {user_id} не найден в списке администраторов для удаления.")
+                 return False # Указываем, что удаления не было
+             else: # rows_affected is None (ошибка БД)
+                 logging.error(f"Не удалось удалить администратора {user_id} (execute вернул None).")
+                 return False
+        except psycopg2.Error as e: # Избыточен, если execute ловит
+             logging.error(f"Ошибка psycopg2 при удалении администратора {user_id}: {e}")
+             return False
+        except Exception as e:
+             logging.error(f"Неожиданная ошибка при удалении администратора {user_id}: {e}")
+             return False
 
     def get_user_raw(self, user_id: int) -> Optional[dict]:
-         """Получает сырые данные пользователя из БД."""
+         """Получает сырые данные пользователя из таблицы 'users'."""
          query = "SELECT * FROM users WHERE user_id = %s"
-         return self.db.execute(query, (user_id,), fetch='one')
+         result = self.db.execute(query, (user_id,), fetch='one')
+         # Конвертируем DictRow в dict для единообразия, если нужно
+         return dict(result) if result else None
 
-    async def get_user_info(self, user_id: int) -> Optional[UserProfile]:
-        """Получает полную информацию о профиле пользователя."""
-        # Consider adding caching logic here if needed (e.g., Redis)
-        # cached = await redis.hgetall(f"user:{user_id}:profile")
-        # if cached: ...
-
+    def get_user_info(self, user_id: int) -> Optional[UserProfile]:
+        """
+        Получает полную информацию о профиле пользователя.
+        Возвращает None, если пользователь не найден или забанен.
+        """
         query = """
             SELECT
                 u.*,
@@ -69,215 +137,254 @@ class UserManager:
         user_row = self.db.execute(query, (user_id,), fetch='one')
 
         if user_row is None:
-            # Optional: register if not found? Depends on your flow.
-            # self.register_user(user_id)
-            # user_row = self.db.execute(query, (user_id,), fetch='one')
-            # if user_row is None: return None
-            return None
-        if user_row['is_banned']: # Return None or a specific indicator for banned users
-            print(f"User {user_id} is banned. Access denied.") # Log this
-            # Decide how to handle banned users in profiles. Return None?
-            # Or return profile with a flag? Let's return None for simplicity now.
+            logging.debug(f"Пользователь {user_id} не найден в БД.")
             return None
 
+        if user_row['is_banned']:
+            logging.info(f"Доступ запрещен: пользователь {user_id} забанен.")
+            return None
 
-        profile = UserProfile(
-            nickname=user_row["username"] or f"User_{user_id}",
-            total_cards_received=user_row["total_cards_received"],
-            cards_owned=user_row["cards_owned_count"],
-            total_cards_in_game=user_row["total_cards_in_game"],
-            season_points=user_row["season_rating"], # Changed from rating to season_rating
-            has_battle_pass=user_row["has_battle_pass"],
-            season_wins=user_row["season_wins"],
-            season_losses=user_row["season_losses"],
-            all_wins=user_row["all_wins"],
-            all_losses=user_row["all_losses"],
-            free_spins=user_row["free_spins"],
-            coins=user_row["coins"],
-            shards=user_row["shards"],
-            shards_rare=user_row["shards_rare"],
-            shards_epic=user_row["shards_epic"],
-            shards_legendary=user_row["shards_legendary"],
-            is_banned=user_row["is_banned"], # <-- Added
-            clan_name=user_row["clan_name"],
-            clan_role=user_row["clan_role"]
-        )
+        try:
+             profile = UserProfile(
+                 nickname=user_row["username"] or f"User_{user_id}",
+                 total_cards_received=user_row["total_cards_received"],
+                 cards_owned=user_row["cards_owned_count"],
+                 total_cards_in_game=user_row["total_cards_in_game"],
+                 season_points=user_row["season_rating"],
+                 has_battle_pass=user_row["has_battle_pass"],
+                 season_wins=user_row["season_wins"],
+                 season_losses=user_row["season_losses"],
+                 all_wins=user_row["all_wins"],
+                 all_losses=user_row["all_losses"],
+                 free_spins=user_row["free_spins"],
+                 coins=user_row["coins"],
+                 shards=user_row["shards"],
+                 shards_rare=user_row["shards_rare"],
+                 shards_epic=user_row["shards_epic"],
+                 shards_legendary=user_row["shards_legendary"],
+                 is_banned=user_row["is_banned"],
+                 clan_name=user_row["clan_name"],
+                 clan_role=user_row["clan_role"]
+             )
+             return profile
+        except KeyError as e:
+             logging.error(f"Ошибка при создании UserProfile для {user_id}: отсутствует ключ {e} в user_row.", exc_info=True)
+             return None
+        except Exception as e:
+             logging.error(f"Неожиданная ошибка при создании UserProfile для {user_id}: {e}", exc_info=True)
+             return None
 
-        # Add caching logic if needed
-        # await redis.hset(f"user:{user_id}:profile", mapping={...})
 
-        return profile
-
-    def update_username(self, user_id: int, new_username: str):
+    def update_username(self, user_id: int, new_username: str) -> bool:
+        """Обновляет username. Возвращает True при успехе."""
         query = "UPDATE users SET username = %s WHERE user_id = %s"
-        self.db.execute(query, (new_username, user_id))
+        rows_affected = self.db.execute(query, (new_username, user_id))
+        return rows_affected == 1
 
-    def update_rating(self, user_id: int, delta_rating: int):
-        """Изменяет общий рейтинг пользователя на указанную дельту."""
+    def update_rating(self, user_id: int, delta_rating: int) -> bool:
+        """Обновляет общий рейтинг. Возвращает True при успехе."""
         query = "UPDATE users SET rating = rating + %s WHERE user_id = %s"
-        self.db.execute(query, (delta_rating, user_id))
+        rows_affected = self.db.execute(query, (delta_rating, user_id))
+        return rows_affected == 1
 
-    def update_season_rating(self, user_id: int, delta_rating: int):
-        """Изменяет сезонный рейтинг пользователя на указанную дельту."""
+    def update_season_rating(self, user_id: int, delta_rating: int) -> bool:
+        """Обновляет сезонный рейтинг. Возвращает True при успехе."""
         query = "UPDATE users SET season_rating = season_rating + %s WHERE user_id = %s"
-        self.db.execute(query, (delta_rating, user_id))
+        rows_affected = self.db.execute(query, (delta_rating, user_id))
+        return rows_affected == 1
 
-    def set_battle_pass(self, user_id: int, has_pass: bool):
+    def set_battle_pass(self, user_id: int, has_pass: bool) -> bool:
+        """Устанавливает статус Battle Pass. Возвращает True при успехе."""
         query = "UPDATE users SET has_battle_pass = %s WHERE user_id = %s"
-        self.db.execute(query, (has_pass, user_id))
+        rows_affected = self.db.execute(query, (has_pass, user_id))
+        return rows_affected == 1
 
-    def set_referrer(self, user_id: int, referrer_id: int):
-        """Устанавливает реферера для пользователя."""
+    def set_referrer(self, user_id: int, referrer_id: int) -> int:
+        """Устанавливает реферера, если его нет. Возвращает количество обновленных строк (0 или 1)."""
+        if user_id == referrer_id:
+             logging.warning(f"Пользователь {user_id} не может быть реферером самого себя.")
+             return 0
         query = "UPDATE users SET referrer_id = %s WHERE user_id = %s AND referrer_id IS NULL"
-        self.db.execute(query, (referrer_id, user_id))
+        rows_affected = self.db.execute(query, (referrer_id, user_id))
+        return rows_affected if rows_affected is not None else 0
 
-    def add_referral(self, user_id: int):
+    def add_referral(self, user_id: int) -> bool:
+        """Увеличивает счетчик рефералов. Возвращает True при успехе."""
         query = "UPDATE users SET referrals = referrals + 1 WHERE user_id = %s"
-        self.db.execute(query, (user_id,))
+        rows_affected = self.db.execute(query, (user_id,))
+        return rows_affected == 1
 
-    def add_coins(self, user_id: int, amount: int):
-        """Добавляет монеты пользователю."""
-        if amount <= 0: return # Не добавляем 0 или отрицательное число
+    def add_coins(self, user_id: int, amount: int, cursor: Optional[Psycopg2Cursor] = None) -> bool:
+        """Добавляет монеты. Возвращает True при успехе."""
+        if amount <= 0: return False
         query = "UPDATE users SET coins = coins + %s WHERE user_id = %s"
-        self.db.execute(query, (amount, user_id))
+        try:
+            if cursor:
+                cursor.execute(query, (amount, user_id))
+                return cursor.rowcount == 1
+            else:
+                rows_affected = self.db.execute(query, (amount, user_id))
+                return rows_affected == 1
+        except Exception as e:
+            logging.error(f"Ошибка при добавлении {amount} монет пользователю {user_id}: {e}")
+            return False
 
     def get_coins(self, user_id: int) -> int:
-        """Получает текущий баланс монет пользователя."""
+        """Получает баланс монет."""
         query = "SELECT coins FROM users WHERE user_id = %s"
         result = self.db.execute(query, (user_id,), fetch='one')
         return result['coins'] if result else 0
 
-    def spend_coins(self, user_id: int, amount: int) -> bool:
-        """Пытается потратить монеты пользователя. Возвращает True при успехе."""
-        if amount <= 0: return False # Нельзя потратить 0 или отрицательное число
+    def spend_coins(self, user_id: int, amount: int, cursor: Optional[Psycopg2Cursor] = None) -> bool:
+        """Списывает монеты. Возвращает True при успехе."""
+        if amount <= 0: return False
 
-        # Update with balance check in WHERE clause for atomicity without explicit transaction
         query = "UPDATE users SET coins = coins - %s WHERE user_id = %s AND coins >= %s"
-        rows_affected = self.db.execute(query, (amount, user_id, amount))
-        return rows_affected == 1 # True if 1 row was updated
+        try:
+            if cursor:
+                cursor.execute(query, (amount, user_id, amount))
+                return cursor.rowcount == 1
+            else:
+                rows_affected = self.db.execute(query, (amount, user_id, amount))
+                return rows_affected == 1
+        except Exception as e:
+            logging.error(f"Ошибка при списании {amount} монет у пользователя {user_id}: {e}")
+            return False
 
     def get_total_cards_received(self, user_id: int) -> int:
-        """
-        Возвращает общее количество карт (включая дубликаты),
-        полученных пользователем за все время.
-        """
+        """Получает общее количество полученных карт."""
         query = "SELECT total_cards_received FROM users WHERE user_id = %s"
         result = self.db.execute(query, (user_id,), fetch='one')
-        # Возвращаем значение счетчика или 0, если пользователь не найден
         return result['total_cards_received'] if result else 0
 
     def get_last_card_time(self, user_id: int) -> Optional[datetime]:
         """Получает время последнего получения карты."""
         query = "SELECT last_card_received FROM users WHERE user_id = %s"
         result = self.db.execute(query, (user_id,), fetch='one')
-        return result['last_card_received'] if result and result['last_card_received'] else None
+        dt_obj = result['last_card_received'] if result and result['last_card_received'] else None
+        if dt_obj and dt_obj.tzinfo is None:
+             return dt_obj.replace(tzinfo=timezone.utc)
+        return dt_obj
 
-    def update_last_card_time(self, user_id: int, time: datetime):
-        """Обновляет время последнего получения карты."""
+    def update_last_card_time(self, user_id: int, time: datetime) -> bool:
+        """Обновляет время последнего получения карты. Возвращает True при успехе."""
+        if time.tzinfo is None:
+            logging.warning("update_last_card_time received a naive datetime. Assuming UTC.")
+            time = time.replace(tzinfo=timezone.utc)
         query = "UPDATE users SET last_card_received = %s WHERE user_id = %s"
-        self.db.execute(query, (time, user_id))
+        rows_affected = self.db.execute(query, (time, user_id))
+        return rows_affected == 1
 
-    def add_shards(self, user_id: int, amount: int, cursor: Optional['psycopg2.extensions.cursor'] = None) -> bool:
-        """Добавляет осколки пользователю. Можно передать курсор для использования в транзакции."""
+    # --- Shard Management ---
+
+    def add_shards(self, user_id: int, amount: int, cursor: Optional[Psycopg2Cursor] = None) -> bool:
+        """Добавляет осколки. Возвращает True при успехе."""
         if amount <= 0: return False
         query = "UPDATE users SET shards = shards + %s WHERE user_id = %s"
         try:
             if cursor:
                 cursor.execute(query, (amount, user_id))
-                return True # Success assumed if no exception in transaction
+                return cursor.rowcount == 1
             else:
-                result = self.db.execute(query, (amount, user_id))
-                return result is not None # True if execution didn't fail
+                rows_affected = self.db.execute(query, (amount, user_id))
+                return rows_affected == 1
         except Exception as e:
-            print(f"Ошибка при добавлении {amount} осколков пользователю {user_id}: {e}")
+            logging.error(f"Ошибка при добавлении {amount} осколков пользователю {user_id}: {e}")
             return False
 
     def get_shards(self, user_id: int) -> int:
-        """Получает баланс осколков пользователя."""
+        """Получает баланс осколков."""
         query = "SELECT shards FROM users WHERE user_id = %s"
         result = self.db.execute(query, (user_id,), fetch='one')
         return result['shards'] if result else 0
 
-    def spend_shards(self, user_id: int, amount: int, cursor: Optional['psycopg2.extensions.cursor'] = None) -> bool:
-        """Пытается потратить осколки пользователя. Можно передать курсор для использования в транзакции."""
+    def spend_shards(self, user_id: int, amount: int, cursor: Optional[Psycopg2Cursor] = None) -> bool:
+        """Списывает осколки. Возвращает True при успехе."""
         if amount <= 0: return False
 
+        query = "UPDATE users SET shards = shards - %s WHERE user_id = %s AND shards >= %s"
         try:
             if cursor:
-                # Check balance within the transaction
-                cursor.execute("SELECT shards FROM users WHERE user_id = %s FOR UPDATE", (user_id,))
-                row = cursor.fetchone()
-                if not row or row[0] < amount:
-                    return False # Not enough shards
-                # Spend shards
-                cursor.execute("UPDATE users SET shards = shards - %s WHERE user_id = %s", (amount, user_id))
-                return True # Success assumed if no exception
+                cursor.execute(query, (amount, user_id, amount))
+                return cursor.rowcount == 1
             else:
-                # Without cursor - use atomic update
-                query = "UPDATE users SET shards = shards - %s WHERE user_id = %s AND shards >= %s"
                 rows_affected = self.db.execute(query, (amount, user_id, amount))
-                return rows_affected == 1 # True if 1 row was updated
+                return rows_affected == 1
         except Exception as e:
-            print(f"Ошибка при попытке потратить {amount} осколков у пользователя {user_id}: {e}")
-            # Important: Don't rollback here if using an external cursor/transaction
+            logging.error(f"Ошибка при списании {amount} осколков у пользователя {user_id}: {e}")
             return False
 
+    # --- Ban Management ---
+
     def ban_user(self, user_id: int) -> bool:
-        """Банит пользователя."""
+        """Банит пользователя. Возвращает True при успехе."""
         query = "UPDATE users SET is_banned = TRUE WHERE user_id = %s"
-        result = self.db.execute(query, (user_id,))
-        return result == 1 # 1 row updated
+        rows_affected = self.db.execute(query, (user_id,))
+        if rows_affected == 1:
+             logging.info(f"Пользователь {user_id} забанен.")
+             return True
+        # Либо пользователь не найден (rows=0), либо ошибка БД (rows=None)
+        logging.warning(f"Не удалось забанить пользователя {user_id} (затронуто строк: {rows_affected}).")
+        return False
+
 
     def unban_user(self, user_id: int) -> bool:
-        """Разбанивает пользователя."""
-        query = "UPDATE users SET is_banned = FALSE WHERE user_id = %s"
-        result = self.db.execute(query, (user_id,))
-        return result == 1 # 1 row updated
+        """Разбанивает пользователя. Возвращает True при успехе."""
+        query = "UPDATE users SET is_banned = FALSE WHERE user_id = %s AND is_banned = TRUE"
+        rows_affected = self.db.execute(query, (user_id,))
+        if rows_affected == 1:
+             logging.info(f"Пользователь {user_id} разбанен.")
+             return True
+        logging.info(f"Не удалось разбанить {user_id} (не найден, не забанен, или ошибка БД - строк: {rows_affected}).")
+        return False
 
     def reset_user_account(self, user_id: int) -> bool:
-        """Сбрасывает данные аккаунта пользователя (ОСТОРОЖНО!)."""
-        conn = self.db._get_connection()
+        """Сбрасывает аккаунт пользователя. USE WITH CAUTION!"""
+        logging.warning(f"!!! НАЧАТ СБРОС АККАУНТА ДЛЯ ПОЛЬЗОВАТЕЛЯ {user_id} !!!")
+        conn = None
         try:
+            conn = self.db._get_connection()
             with conn.cursor() as cur:
-                # Delete related data
+                # Удаляем связанные данные
+                logging.debug(f"Удаление данных user_cards для {user_id}")
                 cur.execute("DELETE FROM user_cards WHERE user_id = %s", (user_id,))
+                logging.debug(f"Удаление данных user_decks для {user_id}")
                 cur.execute("DELETE FROM user_decks WHERE user_id = %s", (user_id,))
+                logging.debug(f"Удаление данных user_promos для {user_id}")
                 cur.execute("DELETE FROM user_promos WHERE user_id = %s", (user_id,))
+                logging.debug(f"Удаление данных user_daily_tasks для {user_id}")
                 cur.execute("DELETE FROM user_daily_tasks WHERE user_id = %s", (user_id,))
+                logging.debug(f"Удаление данных daily_bonus_claimed для {user_id}")
                 cur.execute("DELETE FROM daily_bonus_claimed WHERE user_id = %s", (user_id,))
 
-                # Reset fields in users table to defaults
+                # Сбрасываем поля в таблице users
+                logging.debug(f"Сброс полей в таблице users для {user_id}")
                 cur.execute("""
                     UPDATE users
                     SET
-                        clan_id = NULL,
-                        clan_role = NULL,
-                        has_battle_pass = FALSE,
-                        rating = 0,
-                        season_rating = 0,
-                        coins = 0,
-                        last_card_received = NULL,
-                        referrals = 0,
-                        -- referrer_id = NULL, -- Keep referrer? Optional.
-                        total_cards_received = 0,
-                        free_spins = 0,
-                        shards_rare = 0,
-                        shards_epic = 0,
-                        shards_legendary = 0,
-                        season_wins = 0,
-                        season_losses = 0,
-                        all_wins = 0,
-                        all_losses = 0,
-                        total_duplicates_received = 0,
-                        shards = 0,
-                        is_banned = FALSE -- Unban on reset? Or keep ban status? Let's unban.
+                        clan_id = NULL, clan_role = NULL, has_battle_pass = FALSE,
+                        rating = 0, season_rating = 0, coins = 0, last_card_received = NULL,
+                        referrals = 0, total_cards_received = 0, free_spins = 0,
+                        shards = 0, shards_rare = 0, shards_epic = 0, shards_legendary = 0,
+                        season_wins = 0, season_losses = 0, all_wins = 0, all_losses = 0,
+                        total_duplicates_received = 0, is_banned = FALSE
                     WHERE user_id = %s;
                 """, (user_id,))
+
+                if cur.rowcount != 1:
+                     logging.warning(f"Пользователь {user_id} не найден в таблице users во время сброса (UPDATE не затронул строки).")
+                     # Тем не менее, коммитим удаления связанных данных
+
             conn.commit()
+            logging.info(f"!!! Аккаунт пользователя {user_id} успешно сброшен. !!!")
             return True
         except psycopg2.Error as e:
-            conn.rollback()
-            print(f"Ошибка при сбросе аккаунта пользователя {user_id}: {e}")
+            if conn: conn.rollback()
+            logging.error(f"Ошибка psycopg2 при сбросе аккаунта пользователя {user_id}: {e}")
+            return False
+        except Exception as e:
+            if conn: conn.rollback()
+            logging.error(f"Неожиданная ошибка при сбросе аккаунта пользователя {user_id}: {e}", exc_info=True)
             return False
 
     def get_all_user_ids(self, include_banned=False) -> List[int]:
@@ -289,95 +396,112 @@ class UserManager:
         return [row['user_id'] for row in results] if results else []
 
     # --- Statistics Methods ---
-    def get_total_user_count(self) -> int:
-        query = "SELECT COUNT(*) FROM users"
-        result = self.db.execute(query, fetch='one')
+    # ----- ИСПРАВЛЕНО ЗДЕСЬ: Добавлен аргумент include_banned -----
+    def get_total_user_count(self, include_banned=False) -> int:
+        """Получает общее количество зарегистрированных пользователей."""
+        query = "SELECT COUNT(*) as count FROM users"
+        params = None
+        if not include_banned:
+            query += " WHERE is_banned = FALSE"
+        # Передаем params=None, если он не используется
+        result = self.db.execute(query, params, fetch='one')
         return result['count'] if result else 0
+    # ---------------------------------------------------------
 
     def get_total_cards_given_out(self) -> int:
-        # 'total_cards_received' seems the best metric available
+        """Получает сумму total_cards_received по всем пользователям."""
         query = "SELECT SUM(total_cards_received) as total FROM users"
         result = self.db.execute(query, fetch='one')
         return result['total'] if result and result['total'] is not None else 0
 
     def get_battle_pass_count(self) -> int:
-        query = "SELECT COUNT(*) FROM users WHERE has_battle_pass = TRUE"
+        """Получает количество пользователей с активным Battle Pass (не забаненных)."""
+        query = "SELECT COUNT(*) as count FROM users WHERE has_battle_pass = TRUE AND is_banned = FALSE"
         result = self.db.execute(query, fetch='one')
         return result['count'] if result else 0
 
-    def get_total_coins_in_system(self) -> int:
-        query = "SELECT SUM(coins) as total FROM users"
+    def get_total_currency_in_system(self) -> Dict[str, int]:
+        """Получает общее количество валюты у не забаненных пользователей."""
+        query = """
+            SELECT
+                SUM(coins) as total_coins,
+                SUM(shards) as total_shards,
+                SUM(shards_rare) as total_shards_rare,
+                SUM(shards_epic) as total_shards_epic,
+                SUM(shards_legendary) as total_shards_legendary
+            FROM users
+            WHERE is_banned = FALSE;
+        """
         result = self.db.execute(query, fetch='one')
-        return result['total'] if result and result['total'] is not None else 0
+        if result:
+            # Используем .get() с default=0 для безопасности, если SUM вернет NULL
+            return {
+                "coins": result.get("total_coins", 0) or 0,
+                "shards": result.get("total_shards", 0) or 0,
+                "shards_rare": result.get("total_shards_rare", 0) or 0,
+                "shards_epic": result.get("total_shards_epic", 0) or 0,
+                "shards_legendary": result.get("total_shards_legendary", 0) or 0,
+            }
+        else:
+             return {"coins": 0, "shards": 0, "shards_rare": 0, "shards_epic": 0, "shards_legendary": 0}
 
-    # --- Ranking Methods (Keep existing ones) ---
-    def get_top_users_by_season(self, limit=10):
-        # ... (keep existing implementation) ...
-        return self.db.execute(
-            """
+
+    # --- Ranking Methods ---
+
+    def get_top_users_by_season(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Получает топ N пользователей по сезонному рейтингу (не забаненных)."""
+        query = """
             SELECT user_id, username, season_rating
             FROM users WHERE is_banned = FALSE
-            ORDER BY season_rating DESC
+            ORDER BY season_rating DESC, user_id ASC
             LIMIT %s;
-            """,
-            (limit,),
-            fetch='all'
-        )
+        """
+        results = self.db.execute(query, (limit,), fetch='all')
+        return [dict(row) for row in results] if results else []
 
-
-    def get_user_season_rank(self, user_id):
-        # ... (keep existing implementation) ...
-        result = self.db.execute( # Check if user exists and is not banned first
+    def get_user_season_rank(self, user_id: int) -> Optional[int]:
+        """Получает ранг пользователя по сезонному рейтингу."""
+        user_data = self.db.execute(
             "SELECT season_rating FROM users WHERE user_id = %s AND is_banned = FALSE",
-            (user_id,),
-            fetch='one'
+            (user_id,), fetch='one'
         )
-        if not result: return None # User not found or banned
+        if not user_data:
+            return None
 
-        return self.db.execute(
-            """
+        user_rating = user_data['season_rating']
+        query = """
             SELECT COUNT(*) + 1 as rank
             FROM users
-            WHERE season_rating > (SELECT season_rating FROM users WHERE user_id = %s)
-              AND is_banned = FALSE;
-            """,
-            (user_id,),
-            fetch='one'
-        )['rank']
+            WHERE season_rating > %s AND is_banned = FALSE;
+        """
+        result = self.db.execute(query, (user_rating,), fetch='one')
+        # COUNT(*) всегда возвращает строку, поэтому rank должен быть
+        return result['rank'] if result else None
 
-
-    def get_top_users_alltime(self, limit=10):
-        # ... (keep existing implementation) ...
-        return self.db.execute(
-            """
+    def get_top_users_alltime(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Получает топ N пользователей по общему рейтингу (не забаненных)."""
+        query = """
             SELECT user_id, username, rating
             FROM users WHERE is_banned = FALSE
-            ORDER BY rating DESC
+            ORDER BY rating DESC, user_id ASC
             LIMIT %s;
-            """,
-            (limit,),
-            fetch='all'
-        )
+        """
+        results = self.db.execute(query, (limit,), fetch='all')
+        return [dict(row) for row in results] if results else []
 
-    def get_user_alltime_rank(self, user_id):
-        # ... (keep existing implementation) ...
-        result = self.db.execute( # Check if user exists and is not banned first
+    def get_user_alltime_rank(self, user_id: int) -> Optional[int]:
+        """Получает ранг пользователя по общему рейтингу."""
+        user_data = self.db.execute(
             "SELECT rating FROM users WHERE user_id = %s AND is_banned = FALSE",
-            (user_id,),
-            fetch='one'
+            (user_id,), fetch='one'
         )
-        if not result: return None # User not found or banned
+        if not user_data: return None
 
-        return self.db.execute(
-            """
+        user_rating = user_data['rating']
+        query = """
             SELECT COUNT(*) + 1 as rank
             FROM users
-            WHERE rating > (SELECT rating FROM users WHERE user_id = %s)
-              AND is_banned = FALSE;
-            """,
-            (user_id,),
-            fetch='one'
-        )['rank']
-
-#user_manager = UserManager(db) # Keep this commented out here, instantiate in db_manager.py
-
+            WHERE rating > %s AND is_banned = FALSE;
+        """
+        result = self.db.execute(query, (user_rating,), fetch='one')
+        return result['rank'] if result else None
