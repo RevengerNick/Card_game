@@ -14,12 +14,13 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
 
 # Import necessary managers and database instance from central point
-from bot.Classes.db_manager import user_manager, card_manager, promo_manager, case_manager, db
+from bot.Classes.db_manager import user_manager, card_manager, promo_manager, case_manager, db, boss_manager
 # Import constants, helpers
 from bot.card_database import RARITY_CHOICES, rarity_translate, SUPER_ADMIN_ID
 # Import back button helper if needed within this file directly
 from bot.handlers.mainMenu import back_button # Or define a local helper
 from bot.utils.Filters import IsAdminFilter, IsSuperAdminFilter
+from bot.handlers.boss_handler import format_boss_health
 
 # Ensure managers are initialized (consider a check function or rely on startup)
 if not all([user_manager, card_manager, promo_manager, case_manager, db]):
@@ -1030,6 +1031,114 @@ async def handle_admin_confirm(callback: CallbackQuery, state: FSMContext, bot: 
         except Exception: pass
         await state.clear()
 
+
+@admin_router.message(Command("spawn_boss"), IsSuperAdminFilter())  # Или IsAdminFilter()
+async def cmd_spawn_boss(message: Message, command: CommandObject):
+    args_str = command.args
+    usage = "⚠️ Использование: `/spawn_boss <Здоровье> \"<Имя Босса>\" [FileID изображения]`"
+    if not args_str:
+        await message.reply(usage)
+        return
+
+    try:
+        args = shlex.split(args_str)
+        if len(args) < 2: raise ValueError("Недостаточно аргументов")
+
+        health = int(args[0])
+        if health <= 0: raise ValueError("Здоровье должно быть положительным")
+
+        name = args[1]
+        if not name: raise ValueError("Имя босса не может быть пустым")
+
+        image_path = args[2] if len(args) > 2 else None
+
+    except ValueError as e:
+        await message.reply(f"❌ Ошибка в аргументах: {e}\n{usage}")
+        return
+    except Exception as e:
+        logging.error(f"Ошибка парсинга команды spawn_boss: {e}")
+        await message.reply(f"❌ Ошибка парсинга команды.\n{usage}")
+        return
+
+    await message.answer(f"⏳ Создание нового босса '{name}' с {health} HP...")
+
+    new_boss = boss_manager.create_new_boss(name, health, image_path)
+
+    if new_boss:
+        await message.answer(f"✅ Новый мировой босс '{new_boss['name']}' (ID: {new_boss['id']}) создан и активен!")
+    else:
+        await message.answer("❌ Не удалось создать нового босса. Проверьте логи.")
+
+
+@admin_router.message(Command("boss_info"), IsAdminFilter())
+async def cmd_boss_info(message: Message):
+    active_boss = boss_manager.get_active_boss()
+    if not active_boss:
+        await message.reply("ℹ️ Активного мирового босса сейчас нет.")
+        return
+
+    boss_id = active_boss['id']
+    # Получаем кол-во атаковавших
+    attackers_count = boss_manager.db.execute(
+        "SELECT COUNT(*) as count FROM world_boss_damage WHERE boss_instance_id = %s",
+        (boss_id,), fetch='one'
+    )['count']
+
+    # Получаем топ-3 урона
+    top3 = boss_manager.get_boss_leaderboard(boss_id, limit=3)
+    top3_text = "\n".join(
+        [f"  {e['rank']}. {e.get('username', '??')} - {e['damage_dealt']:,}" for e in top3]) if top3 else "  (Пока нет)"
+    top3_text = top3_text.replace(',', ' ')
+
+    health_display = format_boss_health(active_boss['current_health'], active_boss['max_health'])
+
+    text = (
+        f"👹 <b>Инфо об активном боссе:</b>\n"
+        f"ID: <code>{boss_id}</code>\n"
+        f"Имя: <b>{active_boss['name']}</b>\n"
+        f"Здоровье: {health_display}\n"
+        f"Активен с: {active_boss['start_time'].strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+        f"Атаковало: {attackers_count} игроков\n"
+        f"Награды выданы: {'Да' if active_boss['rewards_distributed'] else 'Нет'}\n"
+        f"Топ-3 урона:\n{top3_text}"
+    )
+    await message.reply(text, parse_mode="HTML")
+
+
+@admin_router.message(Command("distribute_rewards"), IsSuperAdminFilter())
+async def cmd_distribute_rewards(message: Message, command: CommandObject):
+    args = command.args
+    if not args or not args.isdigit():
+        await message.reply(
+            "⚠️ Укажите ID побежденного босса для распределения наград: `/distribute_rewards <boss_id>`")
+        return
+
+    boss_id = int(args)
+    boss_info = boss_manager.db.execute(
+        "SELECT id, name, is_active, rewards_distributed FROM world_bosses WHERE id = %s", (boss_id,), fetch='one')
+
+    if not boss_info:
+        await message.reply(f"❌ Босс с ID {boss_id} не найден.")
+        return
+
+    if boss_info['is_active']:
+        await message.reply(f"❌ Босс '{boss_info['name']}' еще активен. Награды можно выдать только после победы.")
+        return
+
+    if boss_info['rewards_distributed']:
+        await message.reply(f"ℹ️ Награды для босса '{boss_info['name']}' уже были распределены ранее.")
+        return
+
+    await message.answer(f"⏳ Начинаю распределение наград для босса '{boss_info['name']}' (ID: {boss_id})...")
+
+    # Запускаем синхронное распределение (можно сделать асинхронным, если долго)
+    try:
+        boss_manager.distribute_rewards(boss_id)
+        await message.answer(
+            f"✅ Распределение наград для босса ID {boss_id} инициировано. Результаты смотрите в логах.")
+    except Exception as e:
+        logging.error(f"Ошибка при ручном запуске распределения наград для босса {boss_id}: {e}", exc_info=True)
+        await message.answer(f"❌ Произошла ошибка при распределении наград: {e}")
 
 @admin_router.callback_query(F.data == "admin_cancel", StateFilter("*"))
 async def handle_admin_cancel(callback: CallbackQuery, state: FSMContext):

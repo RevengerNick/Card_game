@@ -7,6 +7,9 @@ from typing import Union
 from aiogram.filters import Filter
 # Настройка FSM Storage (MemoryStorage для разработки)
 from aiogram.fsm.storage.memory import MemoryStorage
+
+from bot.handlers.boss_handler import boss_router
+
 fsm_storage = MemoryStorage()
 # Для Redis:
 # from aiogram.fsm.storage.redis import RedisStorage
@@ -34,7 +37,7 @@ from datetime import datetime, timedelta, timezone
 # Убедитесь, что db_manager.py успешно инициализирует ВСЕ менеджеры
 from bot.Classes.db_manager import (
     card_manager, user_manager, task_manager, command_manager,
-    clan_manager, promo_manager, case_manager, db # case_manager импортирован
+    clan_manager, promo_manager, case_manager, db, boss_manager  # case_manager импортирован
 )
 
 # Импорт констант и хелперов
@@ -85,6 +88,7 @@ dp.include_router(admin_router)
 dp.include_router(router_development)
 dp.include_router(arena_handler)
 dp.include_router(clan_handler)
+dp.include_router(boss_router)
 # Обработчики из mainMenu (переименовать бы dp там в router)
 dp.include_router(router_main_menu) # Этот роутер должен идти после более специфичных
 
